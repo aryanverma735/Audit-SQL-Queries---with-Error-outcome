@@ -1,0 +1,453 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+   - Put all "expected values" here
+   - To disable a filter: set that param to NULL
+--------------------------------------------------*/
+params AS (
+    SELECT
+        /* -------------------------
+           ORGANIZATION FILTERS
+        --------------------------*/
+        '1101555770' AS p_org_mstr_prov_id,
+        '1101568795' AS p_ind_mstr_prov_id,
+        'CAWCPERC'    AS p_rgnl_ntwk_id,
+
+        /* -------------------------
+           N (POA_NTWK) FILTERS (OPTIONAL)
+           - Set to NULL to disable that rule
+        --------------------------*/
+        CAST(NULL AS DATE)         AS p_n_poa_ntwk_eff_dt,
+        CAST(NULL AS VARCHAR2(1))  AS p_n_dir_dsply_ind,
+        CAST(NULL AS NUMBER)       AS p_n_max_mbr_cnt,
+        CAST(NULL AS NUMBER)       AS p_n_min_age_nbr,
+        CAST(NULL AS NUMBER)       AS p_n_max_age_nbr,
+        CAST(NULL AS VARCHAR2(10)) AS p_n_pat_gndr_cd,
+        CAST(NULL AS VARCHAR2(10)) AS p_n_prov_role_cd,
+
+        /* -------------------------
+           Contract / Specialty filters (MANDATORY as written)
+        --------------------------*/
+        '1936'                AS p_cp_type_cd,
+        'Surgery, Orthopedic' AS p_spclty_nm,
+        TO_DATE('03/27/2006','MM/DD/YYYY') AS p_rs_spclty_eff_dt,
+        'Y'                   AS p_rs_prmry_spclty_ind,
+
+        /* -------------------------
+           REIMBURESEMETN FITERS (MANDATORY as written)
+        --------------------------*/
+        'CA'       AS p_rm_ra_sor_cd,
+        'SP970000' AS p_rm_ra_1_id,
+        TO_DATE('03/27/2006','MM/DD/YYYY') AS p_rm_ra_eff_dt,
+
+        /* -------------------------
+           LINKAGE FILTERS (J) (OPTIONAL except ROLE_CD if you set it)
+           - Set to NULL to disable that rule
+        --------------------------*/
+        /* ✅ Role code expected value (NOT BLANK). Change this value as needed. */
+        'S' AS p_j_role_cd,
+
+        CAST(NULL AS VARCHAR2(1))  AS p_j_dir_dsply_ind,
+        CAST(NULL AS NUMBER)       AS p_j_min_age_nbr,
+        CAST(NULL AS NUMBER)       AS p_j_max_age_nbr,
+        CAST(NULL AS VARCHAR2(10)) AS p_j_pat_gndr_cd,
+        CAST(NULL AS NUMBER)       AS p_j_max_mbr_cnt,
+        CAST(NULL AS DATE)         AS p_j_eff_dt,
+
+        /* -------------------------
+           Address to audit (normalized)
+        --------------------------*/
+        REGEXP_REPLACE(
+            LOWER('1901 W Lugonia Ave, Ste 210, Redlands, CA, 92374'),
+            '[[:space:]]+',' '
+        ) AS p_norm_addr
+    FROM dual
+),
+
+/* -------------------------------------------------
+   2) Base join
+   - Restrict ONLY the org/ind/network here (performance)
+--------------------------------------------------*/
+base AS (
+    SELECT DISTINCT
+        /* ===== Individual ===== */
+        L_IND.NPI                  AS IND_NPI,
+        L_IND.MSTR_PROV_ID         AS IND_MSTR_PROV_ID,
+        L_IND.PROV_ORG_FED_TAX_ID  AS IND_TIN,
+        L_IND.PROV_CTGRY_CD        AS IND_PROV_CTGRY_CD,
+
+        /* ===== Organization ===== */
+        K.MSTR_PROV_ID             AS ORG_EID,
+        L_ORG.PROV_ORG_NM          AS ORG_NAME,
+        L_ORG.PROV_CTGRY_CD        AS ORG_PROV_CTGRY_CD,
+        L_ORG.NPI                  AS ORG_NPI,
+        L_ORG.PROV_ORG_FED_TAX_ID  AS ORG_TIN,
+
+        M.PADRS_TYPE_CD,
+        K.RLTD_PADRS_KEY,
+
+        /* ===== Linkage (J) ===== */
+        J.ROLE_CD,
+        J.DIR_DSPLY_IND            AS J_DIR_DSPLY_IND,
+        J.MIN_AGE_NBR              AS J_MIN_AGE_NBR,
+        J.MAX_AGE_NBR              AS J_MAX_AGE_NBR,
+        J.PAT_GNDR_CD              AS J_PAT_GNDR_CD,
+        J.MAX_MBR_CNT              AS J_MAX_MBR_CNT,
+        J.RLTD_PADRS_NTWK_EFCTV_DT AS J_EFCTV_DT,
+        J.RLTD_PADRS_NTWK_TRMNTN_DT,
+        J.RLTD_PADRS_NTWK_TRMNTN_RSN_CD,
+
+        /* ===== POA / POA_NTWK (N) ===== */
+        N.PROV_ROLE_CD             AS N_PROV_ROLE_CD,
+        N.DIR_DSPLY_IND            AS N_DIR_DSPLY_IND,
+        N.MIN_AGE_NBR              AS N_MIN_AGE_NBR,
+        N.MAX_AGE_NBR              AS N_MAX_AGE_NBR,
+        N.PAT_GNDR_CD              AS N_PAT_GNDR_CD,
+        N.MAX_MBR_CNT              AS N_MAX_MBR_CNT,
+        N.POA_NTWK_EFCTV_DT        AS N_POA_NTWK_EFCTV_DT,
+
+        /* ===== Contract / Specialty ===== */
+        RC.CP_TYPE_CD,
+        RS.PROV_SPCLTY_KEY,
+        RS.RLTD_PADRS_NW_SPCLTY_EFCTV_DT,
+        RS.PRMRY_SPCLTY_IND,
+        PS.SPCLTY_CD,
+        PN.SPCLTY_NM,
+
+        /* ===== Reimbursement ===== */
+        RM.RA_SOR_CD,
+        RM.RA_1_ID,
+        RM.RA_1_TYPE_CD,
+        RM.RA_EFCTV_DT,
+
+        /* ===== Address / Network ===== */
+        NW.RGNL_NTWK_ID,
+        NW.NTWK_TRMNTN_DT,
+        NW.NTWK_TRMNTN_RSN_CD,
+
+        S.ADRS_EFCTV_DT,
+        S.ADRS_TRMNTN_DT,
+        S.ADRS_TRMNTN_RSN_CD,
+
+        /* ===== Concatenated address ===== */
+        RTRIM(
+            NVL2(NULLIF(TRIM(S.ADRS_LINE_1_TXT), ''), TRIM(S.ADRS_LINE_1_TXT) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.ADRS_LINE_2_TXT), ''), TRIM(S.ADRS_LINE_2_TXT) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.ADRS_LINE_3_TXT), ''), TRIM(S.ADRS_LINE_3_TXT) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.ADRS_CITY_NM), ''),      TRIM(S.ADRS_CITY_NM) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.POSTL_CD_ST_PRVNC_NM), ''), TRIM(S.POSTL_CD_ST_PRVNC_NM) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.POSTL_CD), ''), TRIM(S.POSTL_CD), '')
+        , ' ,') AS FULL_ADDRESS
+
+    FROM SPSOWNER.RLTD_PADRS_NTWK J
+    LEFT JOIN SPSOWNER.RLTD_PADRS K
+        ON K.RLTD_PADRS_KEY = J.RLTD_PADRS_KEY
+    LEFT JOIN RLTD_PADRS_NTWK_CP RC
+        ON J.RLTD_PADRS_NTWK_KEY = RC.RLTD_PADRS_NTWK_KEY
+    LEFT JOIN RLTD_PADRS_NTWK_SPCLTY RS
+        ON J.RLTD_PADRS_NTWK_KEY = RS.RLTD_PADRS_NTWK_KEY
+    LEFT JOIN PROV_SPCLTY PS
+        ON RS.PROV_SPCLTY_KEY = PS.PROV_SPCLTY_KEY
+    LEFT JOIN BOT_PRCG_SPCLTY_XREF PN
+        ON PS.SPCLTY_CD = PN.SPCLTY_CD
+
+    LEFT JOIN SPSOWNER.PROV L_ORG
+        ON L_ORG.MSTR_PROV_ID = K.MSTR_PROV_ID
+       AND L_ORG.PROV_CTGRY_CD = '182'
+    LEFT JOIN SPSOWNER.PROV L_IND
+        ON L_IND.MSTR_PROV_ID = K.RLTD_MSTR_PROV_ID
+       AND L_IND.PROV_CTGRY_CD = '181'
+
+    LEFT JOIN SPSOWNER.POA M
+        ON M.POA_KEY = K.POA_KEY
+    LEFT JOIN SPSOWNER.POA_NTWK N
+        ON N.POA_NTWK_KEY = J.POA_NTWK_KEY
+
+    /* Reimbursement */
+    LEFT JOIN SPSOWNER.POA_NTWK_RA RM
+        ON N.POA_NTWK_KEY = RM.POA_NTWK_KEY
+
+    LEFT JOIN SPSOWNER.PROV_ORG_NTWK PON
+        ON PON.PROV_ORG_NTWK_KEY = N.PROV_ORG_NTWK_KEY
+    LEFT JOIN SPSOWNER.NTWK NW
+        ON PON.NTWK_KEY = NW.NTWK_KEY
+
+    LEFT JOIN SPSOWNER.STNDRDZD_ADRS S
+        ON M.SPS_STNDRDZD_ADRS_ID = S.SPS_STNDRDZD_ADRS_ID
+
+    CROSS JOIN params p
+    WHERE
+        /* ORGANIZATION FILTERS */
+        L_ORG.MSTR_PROV_ID = p.p_org_mstr_prov_id
+        AND L_IND.MSTR_PROV_ID = p.p_ind_mstr_prov_id
+        AND NW.RGNL_NTWK_ID = p.p_rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   3) Evaluate each filter as a rule flag (1 pass, 0 fail)
+   - N and J are optional (NULL param => pass)
+--------------------------------------------------*/
+eval AS (
+    SELECT
+        b.*,
+        p.p_rgnl_ntwk_id AS param_rgnl_ntwk_id,
+        REGEXP_REPLACE(LOWER(b.FULL_ADDRESS), '[[:space:]]+',' ') AS norm_addr,
+
+        /* -------------------------
+           N FILTERS (optional)
+           Use TO_CHAR on numeric-ish fields to avoid ORA-01722 if columns are VARCHAR2/NUMBER mixed.
+        --------------------------*/
+        CASE
+          WHEN p.p_n_poa_ntwk_eff_dt IS NULL THEN 1
+          WHEN b.N_POA_NTWK_EFCTV_DT = p.p_n_poa_ntwk_eff_dt THEN 1 ELSE 0
+        END AS ok_n_effdt,
+
+        CASE
+          WHEN p.p_n_dir_dsply_ind IS NULL THEN 1
+          WHEN b.N_DIR_DSPLY_IND = p.p_n_dir_dsply_ind THEN 1 ELSE 0
+        END AS ok_n_dir,
+
+        CASE
+          WHEN p.p_n_max_mbr_cnt IS NULL THEN 1
+          WHEN TO_CHAR(b.N_MAX_MBR_CNT) = TO_CHAR(p.p_n_max_mbr_cnt) THEN 1 ELSE 0
+        END AS ok_n_maxmbr,
+
+        CASE
+          WHEN p.p_n_min_age_nbr IS NULL THEN 1
+          WHEN TO_CHAR(b.N_MIN_AGE_NBR) = TO_CHAR(p.p_n_min_age_nbr) THEN 1 ELSE 0
+        END AS ok_n_minage,
+
+        CASE
+          WHEN p.p_n_max_age_nbr IS NULL THEN 1
+          WHEN TO_CHAR(b.N_MAX_AGE_NBR) = TO_CHAR(p.p_n_max_age_nbr) THEN 1 ELSE 0
+        END AS ok_n_maxage,
+
+        CASE
+          WHEN p.p_n_pat_gndr_cd IS NULL THEN 1
+          WHEN b.N_PAT_GNDR_CD = p.p_n_pat_gndr_cd THEN 1 ELSE 0
+        END AS ok_n_gender,
+
+        CASE
+          WHEN p.p_n_prov_role_cd IS NULL THEN 1
+          WHEN b.N_PROV_ROLE_CD = p.p_n_prov_role_cd THEN 1 ELSE 0
+        END AS ok_n_role,
+
+        /* -------------------------
+           Contract / Specialty filters (mandatory as written)
+        --------------------------*/
+        CASE WHEN b.CP_TYPE_CD = p.p_cp_type_cd THEN 1 ELSE 0 END AS ok_cp_type,
+        CASE WHEN b.SPCLTY_NM  = p.p_spclty_nm  THEN 1 ELSE 0 END AS ok_spclty_nm,
+        CASE WHEN b.RLTD_PADRS_NW_SPCLTY_EFCTV_DT = p.p_rs_spclty_eff_dt THEN 1 ELSE 0 END AS ok_rs_effdt,
+        CASE WHEN b.PRMRY_SPCLTY_IND = p.p_rs_prmry_spclty_ind THEN 1 ELSE 0 END AS ok_rs_primary,
+
+        /* -------------------------
+           REIMBURESEMETN FITERS (mandatory as written)
+        --------------------------*/
+        CASE WHEN b.RA_SOR_CD   = p.p_rm_ra_sor_cd THEN 1 ELSE 0 END AS ok_rm_sor,
+        CASE WHEN b.RA_1_ID     = p.p_rm_ra_1_id   THEN 1 ELSE 0 END AS ok_rm_id,
+        CASE WHEN b.RA_EFCTV_DT = p.p_rm_ra_eff_dt THEN 1 ELSE 0 END AS ok_rm_effdt,
+
+        /* -------------------------
+           LINKAGE FILTERS (J)
+           ✅ Role Code: expected non-blank value
+           - If p_j_role_cd is NULL => role rule disabled
+        --------------------------*/
+        CASE
+          WHEN p.p_j_role_cd IS NULL THEN 1
+          WHEN b.ROLE_CD = p.p_j_role_cd THEN 1 ELSE 0
+        END AS ok_j_role,
+
+        CASE
+          WHEN p.p_j_dir_dsply_ind IS NULL THEN 1
+          WHEN b.J_DIR_DSPLY_IND = p.p_j_dir_dsply_ind THEN 1 ELSE 0
+        END AS ok_j_dir,
+
+        CASE
+          WHEN p.p_j_min_age_nbr IS NULL THEN 1
+          WHEN TO_CHAR(b.J_MIN_AGE_NBR) = TO_CHAR(p.p_j_min_age_nbr) THEN 1 ELSE 0
+        END AS ok_j_minage,
+
+        CASE
+          WHEN p.p_j_max_age_nbr IS NULL THEN 1
+          WHEN TO_CHAR(b.J_MAX_AGE_NBR) = TO_CHAR(p.p_j_max_age_nbr) THEN 1 ELSE 0
+        END AS ok_j_maxage,
+
+        CASE
+          WHEN p.p_j_pat_gndr_cd IS NULL THEN 1
+          WHEN b.J_PAT_GNDR_CD = p.p_j_pat_gndr_cd THEN 1 ELSE 0
+        END AS ok_j_gender,
+
+        CASE
+          WHEN p.p_j_max_mbr_cnt IS NULL THEN 1
+          WHEN TO_CHAR(b.J_MAX_MBR_CNT) = TO_CHAR(p.p_j_max_mbr_cnt) THEN 1 ELSE 0
+        END AS ok_j_maxmbr,
+
+        CASE
+          WHEN p.p_j_eff_dt IS NULL THEN 1
+          WHEN b.J_EFCTV_DT = p.p_j_eff_dt THEN 1 ELSE 0
+        END AS ok_j_effdt,
+
+        /* -------------------------
+           Address filter
+        --------------------------*/
+        CASE
+          WHEN REGEXP_REPLACE(LOWER(b.FULL_ADDRESS), '[[:space:]]+',' ') = p.p_norm_addr
+          THEN 1 ELSE 0
+        END AS ok_addr
+
+    FROM base b
+    CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   4) Aggregate (overall) pass/fail + fail-summary counts
+--------------------------------------------------*/
+agg AS (
+    SELECT
+        p.p_rgnl_ntwk_id AS rgnl_ntwk_id,
+        COUNT(*) AS base_rows,
+
+        SUM(
+            CASE WHEN
+                ok_n_effdt=1 AND ok_n_dir=1 AND ok_n_maxmbr=1 AND ok_n_minage=1 AND ok_n_maxage=1
+                AND ok_n_gender=1 AND ok_n_role=1
+                AND ok_cp_type=1 AND ok_spclty_nm=1 AND ok_rs_effdt=1 AND ok_rs_primary=1
+                AND ok_rm_sor=1 AND ok_rm_id=1 AND ok_rm_effdt=1
+                AND ok_j_role=1 AND ok_j_dir=1 AND ok_j_minage=1 AND ok_j_maxage=1
+                AND ok_j_gender=1 AND ok_j_maxmbr=1 AND ok_j_effdt=1
+                AND ok_addr=1
+            THEN 1 ELSE 0 END
+        ) AS matching_rows,
+
+        /* Fail counts per rule */
+        SUM(CASE WHEN ok_n_effdt=0 THEN 1 ELSE 0 END) AS fail_n_effdt,
+        SUM(CASE WHEN ok_n_dir=0 THEN 1 ELSE 0 END) AS fail_n_dir,
+        SUM(CASE WHEN ok_n_maxmbr=0 THEN 1 ELSE 0 END) AS fail_n_maxmbr,
+        SUM(CASE WHEN ok_n_minage=0 THEN 1 ELSE 0 END) AS fail_n_minage,
+        SUM(CASE WHEN ok_n_maxage=0 THEN 1 ELSE 0 END) AS fail_n_maxage,
+        SUM(CASE WHEN ok_n_gender=0 THEN 1 ELSE 0 END) AS fail_n_gender,
+        SUM(CASE WHEN ok_n_role=0 THEN 1 ELSE 0 END) AS fail_n_role,
+
+        SUM(CASE WHEN ok_cp_type=0 THEN 1 ELSE 0 END) AS fail_cp_type,
+        SUM(CASE WHEN ok_spclty_nm=0 THEN 1 ELSE 0 END) AS fail_spclty_nm,
+        SUM(CASE WHEN ok_rs_effdt=0 THEN 1 ELSE 0 END) AS fail_rs_effdt,
+        SUM(CASE WHEN ok_rs_primary=0 THEN 1 ELSE 0 END) AS fail_rs_primary,
+
+        SUM(CASE WHEN ok_rm_sor=0 THEN 1 ELSE 0 END) AS fail_rm_sor,
+        SUM(CASE WHEN ok_rm_id=0 THEN 1 ELSE 0 END) AS fail_rm_id,
+        SUM(CASE WHEN ok_rm_effdt=0 THEN 1 ELSE 0 END) AS fail_rm_effdt,
+
+        SUM(CASE WHEN ok_j_role=0 THEN 1 ELSE 0 END) AS fail_j_role,
+        SUM(CASE WHEN ok_j_dir=0 THEN 1 ELSE 0 END) AS fail_j_dir,
+        SUM(CASE WHEN ok_j_minage=0 THEN 1 ELSE 0 END) AS fail_j_minage,
+        SUM(CASE WHEN ok_j_maxage=0 THEN 1 ELSE 0 END) AS fail_j_maxage,
+        SUM(CASE WHEN ok_j_gender=0 THEN 1 ELSE 0 END) AS fail_j_gender,
+        SUM(CASE WHEN ok_j_maxmbr=0 THEN 1 ELSE 0 END) AS fail_j_maxmbr,
+        SUM(CASE WHEN ok_j_effdt=0 THEN 1 ELSE 0 END) AS fail_j_effdt,
+
+        SUM(CASE WHEN ok_addr=0 THEN 1 ELSE 0 END) AS fail_addr
+
+    FROM eval e
+    CROSS JOIN params p
+    GROUP BY p.p_rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   5) Overall audit row (ALWAYS one row)
+--------------------------------------------------*/
+overall AS (
+    SELECT
+        p.p_rgnl_ntwk_id AS rgnl_ntwk_id,
+        NVL(a.base_rows, 0) AS base_rows,
+        NVL(a.matching_rows, 0) AS matching_rows,
+        CASE WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass' ELSE 'Audit Fail' END AS audit_status,
+
+        CASE
+            WHEN NVL(a.base_rows, 0) = 0 THEN 'No rows after joins for ORG/IND/NETWORK (check IDs/linkage).'
+            WHEN NVL(a.matching_rows, 0) > 0 THEN NULL
+            ELSE 'Audit failed. Use FAIL_SUMMARY + ROW_FAIL_DUE_TO to identify failing filters.'
+        END AS fail_due_to,
+
+        CASE
+            WHEN NVL(a.base_rows, 0) = 0 THEN NULL
+            ELSE
+                'N.EFFDT=' || a.fail_n_effdt ||
+                ', N.DIR=' || a.fail_n_dir ||
+                ', N.MAX_MBR=' || a.fail_n_maxmbr ||
+                ', N.MIN_AGE=' || a.fail_n_minage ||
+                ', N.MAX_AGE=' || a.fail_n_maxage ||
+                ', N.GENDER=' || a.fail_n_gender ||
+                ', N.ROLE=' || a.fail_n_role ||
+                ', CP_TYPE=' || a.fail_cp_type ||
+                ', SPCLTY=' || a.fail_spclty_nm ||
+                ', RS_EFFDT=' || a.fail_rs_effdt ||
+                ', RS_PRIMARY=' || a.fail_rs_primary ||
+                ', RM.SOR=' || a.fail_rm_sor ||
+                ', RM.ID=' || a.fail_rm_id ||
+                ', RM.EFFDT=' || a.fail_rm_effdt ||
+                ', J.ROLE=' || a.fail_j_role ||
+                ', J.DIR=' || a.fail_j_dir ||
+                ', J.MIN_AGE=' || a.fail_j_minage ||
+                ', J.MAX_AGE=' || a.fail_j_maxage ||
+                ', J.GENDER=' || a.fail_j_gender ||
+                ', J.MAX_MBR=' || a.fail_j_maxmbr ||
+                ', J.EFFDT=' || a.fail_j_effdt ||
+                ', ADDRESS=' || a.fail_addr
+        END AS fail_summary
+
+    FROM params p
+    LEFT JOIN agg a
+        ON a.rgnl_ntwk_id = p.p_rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   6) Detail rows + per-row failure reason
+--------------------------------------------------*/
+detail AS (
+    SELECT
+        e.*,
+        RTRIM(
+            /* N */
+            (CASE WHEN e.ok_n_effdt=0   THEN 'N.POA_NTWK_EFCTV_DT, ' END) ||
+            (CASE WHEN e.ok_n_dir=0     THEN 'N.DIR_DSPLY_IND, ' END) ||
+            (CASE WHEN e.ok_n_maxmbr=0  THEN 'N.MAX_MBR_CNT, ' END) ||
+            (CASE WHEN e.ok_n_minage=0  THEN 'N.MIN_AGE_NBR, ' END) ||
+            (CASE WHEN e.ok_n_maxage=0  THEN 'N.MAX_AGE_NBR, ' END) ||
+            (CASE WHEN e.ok_n_gender=0  THEN 'N.PAT_GNDR_CD, ' END) ||
+            (CASE WHEN e.ok_n_role=0    THEN 'N.PROV_ROLE_CD, ' END) ||
+            /* Contract/Specialty */
+            (CASE WHEN e.ok_cp_type=0    THEN 'RC.CP_TYPE_CD, ' END) ||
+            (CASE WHEN e.ok_spclty_nm=0  THEN 'PN.SPCLTY_NM, ' END) ||
+            (CASE WHEN e.ok_rs_effdt=0   THEN 'RS.RLTD_PADRS_NW_SPCLTY_EFCTV_DT, ' END) ||
+            (CASE WHEN e.ok_rs_primary=0 THEN 'RS.PRMRY_SPCLTY_IND, ' END) ||
+            /* RM */
+            (CASE WHEN e.ok_rm_sor=0    THEN 'RM.RA_SOR_CD, ' END) ||
+            (CASE WHEN e.ok_rm_id=0     THEN 'RM.RA_1_ID, ' END) ||
+            (CASE WHEN e.ok_rm_effdt=0  THEN 'RM.RA_EFCTV_DT, ' END) ||
+            /* J */
+            (CASE WHEN e.ok_j_role=0    THEN 'J.ROLE_CD, ' END) ||
+            (CASE WHEN e.ok_j_dir=0     THEN 'J.DIR_DSPLY_IND, ' END) ||
+            (CASE WHEN e.ok_j_minage=0  THEN 'J.MIN_AGE_NBR, ' END) ||
+            (CASE WHEN e.ok_j_maxage=0  THEN 'J.MAX_AGE_NBR, ' END) ||
+            (CASE WHEN e.ok_j_gender=0  THEN 'J.PAT_GNDR_CD, ' END) ||
+            (CASE WHEN e.ok_j_maxmbr=0  THEN 'J.MAX_MBR_CNT, ' END) ||
+            (CASE WHEN e.ok_j_effdt=0   THEN 'J.RLTD_PADRS_NTWK_EFCTV_DT, ' END) ||
+            /* Address */
+            (CASE WHEN e.ok_addr=0      THEN 'FULL_ADDRESS, ' END)
+        , ', ') AS row_fail_due_to
+    FROM eval e
+)
+
+/* -------------------------------------------------
+   7) Final output: ALWAYS returns something
+--------------------------------------------------*/
+SELECT
+    d.*,
+    o.audit_status,
+    o.fail_due_to,
+    o.fail_summary,
+    o.base_rows,
+    o.matching_rows
+FROM overall o
+LEFT JOIN detail d
+    ON d.param_rgnl_ntwk_id = o.rgnl_ntwk_id;

@@ -1,0 +1,219 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+   - Set expected values here.
+   - To disable a rule, set that param to NULL.
+--------------------------------------------------*/
+params AS (
+  SELECT
+    /* Mandatory inputs (from your WHERE) */
+    'Med-Ped Associates' AS p_grpg_nm,
+
+    /* Use comma-separated list for IN-style checks */
+    '06052187' AS p_altid_txt_list,
+
+    /* TIN expected value:
+       - If you want to check blank: set to '' (empty) OR NULL? -> use '' to mean blank check
+       - If you want to check a specific TIN: set to '123456789'
+       - If you want to disable the TIN rule: set to NULL
+    */
+    '' AS p_fed_tax_id,
+
+    /* OPTIONAL filters (currently disabled) */
+    'SMNTWKCAID01,SMNTWKCAID02,SMNTWKCLR001,SMNTWKKIDS01,FLNTWKHIXI01' AS p_ntwk_id_list,
+    TO_DATE(NULL,'MM/DD/YYYY') AS p_grpg_ntwk_eff_dt,
+    TO_DATE(NULL,'MM/DD/YYYY') AS p_grpg_altid_eff_dt
+
+  FROM dual
+),
+
+/* -------------------------------------------------
+   2) Base query (your select + joins)
+   - Keep only GRPG_NM restriction in base for performance.
+   - Other filters become audit rules (so you can see why they fail).
+--------------------------------------------------*/
+base AS (
+  SELECT
+    G.GRPG_ID,
+    G.GRPG_NM,
+    G.GRPG_ROLE_CD,
+    G.PAYE_ENTY_CD,
+    G.GRPG_TYPE_CD,
+    GA.ALTID_SOR_CD,
+    GA.ALTID_TYPE_CD,
+    GA.ALTID_TXT,
+    GA.GRPG_ALTID_EFCTV_DT,
+    GR.RMTNC_ID,
+    GR.GRPG_RMTNC_KEY,
+    GP.RLTD_PADRS_KEY,
+    NTWK.RGNL_NTWK_ID,
+    GN.GRPG_NTWK_EFCTV_DT,
+    G_ORG.MSTR_PROV_ID,
+    G_ORG.GRPG_PRVORG_RLTN_EFCTV_DT,
+    GT.FED_TAX_ID,
+    GT.GRPG_TAX_IDFCTN_EFCTV_DT,
+    GG.RLTD_GRPG_ID,
+
+    /* === FULL_ADDRESS: built ONLY from SP (related address) — NO FALLBACK === */
+    COALESCE(
+      RTRIM(
+        NVL2(NULLIF(TRIM(SP.ADRS_LINE_1_TXT), ''), TRIM(SP.ADRS_LINE_1_TXT) || ', ', '') ||
+        NVL2(NULLIF(TRIM(SP.ADRS_LINE_2_TXT), ''), TRIM(SP.ADRS_LINE_2_TXT) || ', ', '') ||
+        NVL2(NULLIF(TRIM(SP.ADRS_LINE_3_TXT), ''), TRIM(SP.ADRS_LINE_3_TXT) || ', ', '') ||
+        NVL2(NULLIF(TRIM(SP.ADRS_CITY_NM), ''),     TRIM(SP.ADRS_CITY_NM)     || ', ', '') ||
+        NVL2(NULLIF(TRIM(SP.POSTL_CD_ST_PRVNC_NM), ''), TRIM(SP.POSTL_CD_ST_PRVNC_NM) || ', ', '') ||
+        CASE
+          WHEN NULLIF(TRIM(SP.POSTL_CD), '') IS NOT NULL
+           AND NULLIF(TRIM(SP.POSTL_CD_PLUS_FOUR), '') IS NOT NULL
+            THEN TRIM(SP.POSTL_CD) || '-' || TRIM(SP.POSTL_CD_PLUS_FOUR)
+          WHEN NULLIF(TRIM(SP.POSTL_CD), '') IS NOT NULL
+            THEN TRIM(SP.POSTL_CD)
+          WHEN NULLIF(TRIM(SP.POSTL_CD_PLUS_FOUR), '') IS NOT NULL
+            THEN TRIM(SP.POSTL_CD_PLUS_FOUR)
+          ELSE NULL
+        END
+      , ', ')
+    , ''
+    ) AS FULL_ADDRESS,
+
+    /* === REMIT_ADDRESS: built from SR (remit/POA address) === */
+    COALESCE(
+      RTRIM(
+        NVL2(NULLIF(TRIM(SR.ADRS_LINE_1_TXT), ''), TRIM(SR.ADRS_LINE_1_TXT) || ', ', '') ||
+        NVL2(NULLIF(TRIM(SR.ADRS_LINE_2_TXT), ''), TRIM(SR.ADRS_LINE_2_TXT) || ', ', '') ||
+        NVL2(NULLIF(TRIM(SR.ADRS_LINE_3_TXT), ''), TRIM(SR.ADRS_LINE_3_TXT) || ', ', '') ||
+        NVL2(NULLIF(TRIM(SR.ADRS_CITY_NM), ''),     TRIM(SR.ADRS_CITY_NM)     || ', ', '') ||
+        NVL2(NULLIF(TRIM(SR.POSTL_CD_ST_PRVNC_NM), ''), TRIM(SR.POSTL_CD_ST_PRVNC_NM) || ', ', '') ||
+        CASE
+          WHEN NULLIF(TRIM(SR.POSTL_CD), '') IS NOT NULL
+           AND NULLIF(TRIM(SR.POSTL_CD_PLUS_FOUR), '') IS NOT NULL
+            THEN TRIM(SR.POSTL_CD) || '-' || TRIM(SR.POSTL_CD_PLUS_FOUR)
+          WHEN NULLIF(TRIM(SR.POSTL_CD), '') IS NOT NULL
+            THEN TRIM(SR.POSTL_CD)
+          WHEN NULLIF(TRIM(SR.POSTL_CD_PLUS_FOUR), '') IS NOT NULL
+            THEN TRIM(SR.POSTL_CD_PLUS_FOUR)
+          ELSE NULL
+        END
+      , ', ')
+    , ''
+    ) AS REMIT_ADDRESS
+
+  FROM GRPG G
+  LEFT JOIN GRPG_ALT_IDFCTN GA               ON GA.GRPG_ID = G.GRPG_ID
+  LEFT JOIN GRPG_RMTNC GR                    ON GR.GRPG_ID = G.GRPG_ID
+  LEFT JOIN POA_RMTNC PR                     ON PR.RMTNC_ID = GR.RMTNC_ID
+  LEFT JOIN POA PRR                          ON PRR.POA_KEY = PR.POA_KEY
+  LEFT JOIN STNDRDZD_ADRS SR                 ON SR.SPS_STNDRDZD_ADRS_ID = PRR.SPS_STNDRDZD_ADRS_ID
+  LEFT JOIN GRPG_RLTD_PADRS GP               ON GP.GRPG_ID = G.GRPG_ID
+  LEFT JOIN RLTD_PADRS R                     ON R.RLTD_PADRS_KEY = GP.RLTD_PADRS_KEY
+  LEFT JOIN POA P                            ON R.POA_KEY = P.POA_KEY
+  LEFT JOIN STNDRDZD_ADRS SP                 ON SP.SPS_STNDRDZD_ADRS_ID = P.SPS_STNDRDZD_ADRS_ID
+  LEFT JOIN GRPG_NTWK GN                     ON GN.GRPG_ID = G.GRPG_ID
+  LEFT JOIN NTWK                             ON NTWK.NTWK_KEY = GN.NTWK_KEY
+  LEFT JOIN GRPG_PROV_ORG_RLTNSHP G_ORG      ON G_ORG.GRPG_ID = G.GRPG_ID
+  LEFT JOIN GRPG_TAX_IDFCTN GT               ON GT.GRPG_ID = G.GRPG_ID
+  LEFT JOIN GRPG_GRPG_RLTNSHP GG             ON GG.GRPG_ID = G.GRPG_ID
+  CROSS JOIN params p
+  WHERE
+    /* Keep this restriction in base for performance */
+    G.GRPG_NM = p.p_grpg_nm
+),
+
+/* -------------------------------------------------
+   3) Evaluate each filter as a rule flag (1 pass, 0 fail)
+--------------------------------------------------*/
+eval AS (
+  SELECT
+    b.*,
+
+    /* Rule: GA.ALTID_TXT IN ('06052187', ...) */
+    CASE
+      WHEN p.p_altid_txt_list IS NULL THEN 1
+      WHEN INSTR(',' || p.p_altid_txt_list || ',', ',' || b.ALTID_TXT || ',') > 0 THEN 1
+      ELSE 0
+    END AS ok_altid_txt,
+
+    /* Rule: GT.FED_TAX_ID = '' (Oracle: '' == NULL)
+       - If expected is NULL => rule disabled
+       - If expected is '' => check TRIM(FED_TAX_ID) IS NULL
+       - Else => exact match
+    */
+    CASE
+      WHEN p.p_fed_tax_id IS NULL THEN 1
+      WHEN TRIM(p.p_fed_tax_id) IS NULL THEN CASE WHEN TRIM(b.FED_TAX_ID) IS NULL THEN 1 ELSE 0 END
+      WHEN b.FED_TAX_ID = p.p_fed_tax_id THEN 1
+      ELSE 0
+    END AS ok_fed_tax_id,
+
+    /* Optional: Network ID IN (...) */
+    CASE
+      WHEN p.p_ntwk_id_list IS NULL THEN 1
+      WHEN INSTR(',' || p.p_ntwk_id_list || ',', ',' || b.RGNL_NTWK_ID || ',') > 0 THEN 1
+      ELSE 0
+    END AS ok_ntwk_id,
+
+    /* Optional: GN.GRPG_NTWK_EFCTV_DT */
+    CASE
+      WHEN p.p_grpg_ntwk_eff_dt IS NULL THEN 1
+      WHEN b.GRPG_NTWK_EFCTV_DT = p.p_grpg_ntwk_eff_dt THEN 1
+      ELSE 0
+    END AS ok_grpg_ntwk_effdt,
+
+    /* Optional: GA.GRPG_ALTID_EFCTV_DT */
+    CASE
+      WHEN p.p_grpg_altid_eff_dt IS NULL THEN 1
+      WHEN b.GRPG_ALTID_EFCTV_DT = p.p_grpg_altid_eff_dt THEN 1
+      ELSE 0
+    END AS ok_altid_effdt
+
+  FROM base b
+  CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   4) Aggregate overall pass/fail and failure counts
+--------------------------------------------------*/
+agg AS (
+  SELECT
+    COUNT(*) AS base_rows,
+    SUM(
+      CASE WHEN ok_altid_txt=1
+         AND ok_fed_tax_id=1
+         AND ok_ntwk_id=1
+         AND ok_grpg_ntwk_effdt=1
+         AND ok_altid_effdt=1
+      THEN 1 ELSE 0 END
+    ) AS matching_rows,
+
+    SUM(CASE WHEN ok_altid_txt=0 THEN 1 ELSE 0 END) AS fail_altid_txt,
+    SUM(CASE WHEN ok_fed_tax_id=0 THEN 1 ELSE 0 END) AS fail_fed_tax_id,
+    SUM(CASE WHEN ok_ntwk_id=0 THEN 1 ELSE 0 END) AS fail_ntwk_id,
+    SUM(CASE WHEN ok_grpg_ntwk_effdt=0 THEN 1 ELSE 0 END) AS fail_grpg_ntwk_effdt,
+    SUM(CASE WHEN ok_altid_effdt=0 THEN 1 ELSE 0 END) AS fail_altid_effdt
+  FROM eval
+),
+
+/* -------------------------------------------------
+   5) "Blocking" filters (no row passes that rule)
+--------------------------------------------------*/
+blocking AS (
+  SELECT
+    LISTAGG(fail_field, ', ') WITHIN GROUP (ORDER BY fail_field) AS blocking_filters
+  FROM (
+    SELECT 'GA.ALTID_TXT' AS fail_field FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_altid_txt) = 0
+
+    UNION ALL
+    SELECT 'GT.FED_TAX_ID' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_fed_tax_id) = 0
+
+    UNION ALL
+    SELECT 'NTWK.RGNL_NTWK_ID' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_ntwk_id) = 0
+
+    UNION ALL
+    SELECT 'GN.GRPG_NTWK_EFCTV_DT' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_grpg_ntwk_effdt) = 0
+
+    UNION ALL
+    SELECT 'GA.GRPG_ALTID_EFCTV_DT' FROM agg

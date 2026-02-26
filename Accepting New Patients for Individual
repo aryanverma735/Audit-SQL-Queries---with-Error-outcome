@@ -1,0 +1,338 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+   - Put all "expected values" here
+   - To disable a filter: set that param to NULL
+--------------------------------------------------*/
+params AS (
+    SELECT
+        /* ORGANIZATION FILTERS (keep these mandatory) */
+        '1103259864' AS p_org_mstr_prov_id,
+        '1100177811' AS p_ind_mstr_prov_id,
+        'BHMOSG00'    AS p_rgnl_ntwk_id,
+
+        /* J / RC filters from your current WHERE (mandatory as written) */
+        TO_DATE('09/01/2003','MM/DD/YYYY') AS p_j_rltd_padrs_ntwk_eff_dt,
+        '1937' AS p_rc_cp_type_cd,
+        TO_DATE('02/05/2026','MM/DD/YYYY') AS p_rc_cp_eff_dt,
+
+        /* Address to audit (normalized same as your query) */
+        REGEXP_REPLACE(LOWER(TRIM('11843 South St, Cerritos, CA, 90703')), '[^a-z0-9]+', '') AS p_norm_addr,
+
+        /* -------------------------------------------------
+           OPTIONAL FILTERS (you had them commented out)
+           Set to a value to enforce, or leave NULL to ignore
+        --------------------------------------------------*/
+
+        /* J filters */
+        CAST(NULL AS VARCHAR2(1))  AS p_j_dir_dsply_ind,   -- e.g. 'Y'
+        CAST(NULL AS VARCHAR2(10)) AS p_j_max_mbr_cnt,     -- e.g. '99999'
+        CAST(NULL AS VARCHAR2(10)) AS p_j_min_age_nbr,     -- e.g. '0'
+        CAST(NULL AS VARCHAR2(10)) AS p_j_max_age_nbr,     -- e.g. '99'
+        CAST(NULL AS VARCHAR2(10)) AS p_j_pat_gndr_cd,     -- e.g. '8002'
+        CAST(NULL AS VARCHAR2(10)) AS p_j_role_cd,         -- e.g. 'S'
+
+        /* RS / PN filters (DATE placeholder now uses TO_DATE(NULL,..)) */
+        TO_DATE(NULL,'MM/DD/YYYY') AS p_rs_eff_dt,         -- e.g. TO_DATE('10/02/2023','MM/DD/YYYY')
+        CAST(NULL AS VARCHAR2(1))   AS p_rs_prmry_ind,      -- e.g. 'Y'
+        CAST(NULL AS VARCHAR2(200)) AS p_pn_spclty_nm       -- e.g. 'Psychiatry'
+    FROM dual
+),
+
+/* -------------------------------------------------
+   2) Base join
+   - Restrict ONLY org/ind/network here (performance)
+   - Do NOT apply other filters here; they become rules
+--------------------------------------------------*/
+base AS (
+    SELECT DISTINCT
+        L_IND.NPI AS IND_NPI,
+        L_IND.MSTR_PROV_ID AS IND_MSTR_PROV_ID,
+        L_IND.PROV_ORG_FED_TAX_ID AS IND_TIN,
+        L_IND.PROV_CTGRY_CD AS IND_PROV_CTGRY_CD,
+
+        K.MSTR_PROV_ID AS ORG_EID,
+        L_ORG.PROV_ORG_NM AS ORG_NAME,
+        L_ORG.PROV_CTGRY_CD AS ORG_PROV_CTGRY_CD,
+        L_ORG.NPI AS ORG_NPI,
+        L_ORG.PROV_ORG_FED_TAX_ID AS ORG_TIN,
+
+        M.PADRS_TYPE_CD,
+        K.RLTD_PADRS_KEY,
+
+        /* J */
+        J.DIR_DSPLY_IND,
+        J.MAX_MBR_CNT,
+        J.MIN_AGE_NBR,
+        J.MAX_AGE_NBR,
+        J.PAT_GNDR_CD,
+        J.ROLE_CD,
+        J.RLTD_PADRS_NTWK_EFCTV_DT,
+        J.RLTD_PADRS_NTWK_TRMNTN_DT,
+        J.RLTD_PADRS_NTWK_TRMNTN_RSN_CD,
+
+        /* RC */
+        RC.CP_TYPE_CD,
+        RC.RLTD_PADRS_CP_EFCTV_DT,
+
+        /* RS/PS/PN */
+        RS.PROV_SPCLTY_KEY,
+        RS.RLTD_PADRS_NW_SPCLTY_EFCTV_DT,
+        RS.PRMRY_SPCLTY_IND,
+        PS.SPCLTY_CD,
+        PN.SPCLTY_NM,
+
+        /* Address fields */
+        S.ADRS_LINE_1_TXT,
+        S.ADRS_LINE_2_TXT,
+        S.ADRS_LINE_3_TXT,
+        S.POSTL_CD_ST_PRVNC_NM,
+        S.POSTL_CD,
+        S.ADRS_CITY_NM,
+        S.ADRS_CNTRY_NM,
+        S.ADRS_EFCTV_DT,
+        S.ADRS_TRMNTN_DT,
+        S.ADRS_TRMNTN_RSN_CD,
+
+        /* Network */
+        NW.RGNL_NTWK_ID,
+        NW.NTWK_TRMNTN_DT,
+        NW.NTWK_TRMNTN_RSN_CD,
+
+        /* === Concatenated address (your logic) === */
+        REGEXP_REPLACE(
+            NVL2(NULLIF(TRIM(S.ADRS_LINE_1_TXT), ''), TRIM(S.ADRS_LINE_1_TXT) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.ADRS_LINE_2_TXT), ''), TRIM(S.ADRS_LINE_2_TXT) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.ADRS_LINE_3_TXT), ''), TRIM(S.ADRS_LINE_3_TXT) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.ADRS_CITY_NM), ''), TRIM(S.ADRS_CITY_NM) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.POSTL_CD_ST_PRVNC_NM), ''), TRIM(S.POSTL_CD_ST_PRVNC_NM) || ', ', '') ||
+            NVL2(NULLIF(TRIM(S.POSTL_CD), ''), TRIM(S.POSTL_CD), '')
+          , '[, ]+$', ''
+        ) AS FULL_ADDRESS
+
+    FROM SPSOWNER.RLTD_PADRS_NTWK J
+    JOIN SPSOWNER.RLTD_PADRS K
+        ON K.RLTD_PADRS_KEY = J.RLTD_PADRS_KEY
+    JOIN RLTD_PADRS_NTWK_CP RC
+        ON J.RLTD_PADRS_NTWK_KEY = RC.RLTD_PADRS_NTWK_KEY
+    JOIN RLTD_PADRS_NTWK_SPCLTY RS
+        ON J.RLTD_PADRS_NTWK_KEY = RS.RLTD_PADRS_NTWK_KEY
+    JOIN PROV_SPCLTY PS
+        ON RS.PROV_SPCLTY_KEY = PS.PROV_SPCLTY_KEY
+    JOIN BOT_PRCG_SPCLTY_XREF PN
+        ON PS.SPCLTY_CD = PN.SPCLTY_CD
+    JOIN SPSOWNER.PROV L_ORG
+        ON L_ORG.MSTR_PROV_ID = K.MSTR_PROV_ID
+       AND L_ORG.PROV_CTGRY_CD = '182'
+    JOIN SPSOWNER.PROV L_IND
+        ON L_IND.MSTR_PROV_ID = K.RLTD_MSTR_PROV_ID
+       AND L_IND.PROV_CTGRY_CD = '181'
+    JOIN SPSOWNER.POA M
+        ON M.POA_KEY = K.POA_KEY
+    JOIN SPSOWNER.POA_NTWK N
+        ON N.POA_NTWK_KEY = J.POA_NTWK_KEY
+    JOIN SPSOWNER.PROV_ORG_NTWK PON
+        ON PON.PROV_ORG_NTWK_KEY = N.PROV_ORG_NTWK_KEY
+    JOIN SPSOWNER.NTWK NW
+        ON PON.NTWK_KEY = NW.NTWK_KEY
+    JOIN SPSOWNER.STNDRDZD_ADRS S
+        ON M.SPS_STNDRDZD_ADRS_ID = S.SPS_STNDRDZD_ADRS_ID
+    CROSS JOIN params p
+    WHERE
+        /* ORGANIZATION FILTERS */
+        L_ORG.MSTR_PROV_ID = p.p_org_mstr_prov_id
+        AND L_IND.MSTR_PROV_ID = p.p_ind_mstr_prov_id
+        AND NW.RGNL_NTWK_ID = p.p_rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   3) Evaluate filters as rule flags (1 pass, 0 fail)
+--------------------------------------------------*/
+eval AS (
+    SELECT
+        b.*,
+        p.p_rgnl_ntwk_id AS param_rgnl_ntwk_id,
+
+        /* Normalize address like your audit */
+        REGEXP_REPLACE(LOWER(TRIM(b.FULL_ADDRESS)), '[^a-z0-9]+', '') AS norm_addr,
+
+        /* Mandatory rules (from your active WHERE) */
+        CASE WHEN b.RLTD_PADRS_NTWK_EFCTV_DT = p.p_j_rltd_padrs_ntwk_eff_dt THEN 1 ELSE 0 END AS ok_j_effdt_mand,
+        CASE WHEN b.CP_TYPE_CD = p.p_rc_cp_type_cd THEN 1 ELSE 0 END AS ok_cp_type_mand,
+        CASE WHEN b.RLTD_PADRS_CP_EFCTV_DT = p.p_rc_cp_eff_dt THEN 1 ELSE 0 END AS ok_cp_effdt_mand,
+
+        /* OPTIONAL J rules */
+        CASE
+          WHEN p.p_j_dir_dsply_ind IS NULL THEN 1
+          WHEN b.DIR_DSPLY_IND = p.p_j_dir_dsply_ind THEN 1 ELSE 0
+        END AS ok_j_dir,
+
+        CASE
+          WHEN p.p_j_max_mbr_cnt IS NULL THEN 1
+          WHEN TO_CHAR(b.MAX_MBR_CNT) = TO_CHAR(p.p_j_max_mbr_cnt) THEN 1 ELSE 0
+        END AS ok_j_maxmbr,
+
+        CASE
+          WHEN p.p_j_min_age_nbr IS NULL THEN 1
+          WHEN TO_CHAR(b.MIN_AGE_NBR) = TO_CHAR(p.p_j_min_age_nbr) THEN 1 ELSE 0
+        END AS ok_j_minage,
+
+        CASE
+          WHEN p.p_j_max_age_nbr IS NULL THEN 1
+          WHEN TO_CHAR(b.MAX_AGE_NBR) = TO_CHAR(p.p_j_max_age_nbr) THEN 1 ELSE 0
+        END AS ok_j_maxage,
+
+        CASE
+          WHEN p.p_j_pat_gndr_cd IS NULL THEN 1
+          WHEN b.PAT_GNDR_CD = p.p_j_pat_gndr_cd THEN 1 ELSE 0
+        END AS ok_j_gender,
+
+        CASE
+          WHEN p.p_j_role_cd IS NULL THEN 1
+          WHEN b.ROLE_CD = p.p_j_role_cd THEN 1 ELSE 0
+        END AS ok_j_role,
+
+        /* OPTIONAL RS / PN rules */
+        CASE
+          WHEN p.p_rs_eff_dt IS NULL THEN 1
+          WHEN b.RLTD_PADRS_NW_SPCLTY_EFCTV_DT = p.p_rs_eff_dt THEN 1 ELSE 0
+        END AS ok_rs_effdt,
+
+        CASE
+          WHEN p.p_rs_prmry_ind IS NULL THEN 1
+          WHEN b.PRMRY_SPCLTY_IND = p.p_rs_prmry_ind THEN 1 ELSE 0
+        END AS ok_rs_primary,
+
+        CASE
+          WHEN p.p_pn_spclty_nm IS NULL THEN 1
+          WHEN b.SPCLTY_NM = p.p_pn_spclty_nm THEN 1 ELSE 0
+        END AS ok_pn_spclty,
+
+        /* Address rule */
+        CASE
+          WHEN REGEXP_REPLACE(LOWER(TRIM(b.FULL_ADDRESS)), '[^a-z0-9]+', '')
+               = p.p_norm_addr
+          THEN 1 ELSE 0
+        END AS ok_addr
+
+    FROM base b
+    CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   4) Aggregate overall pass/fail and fail counts
+--------------------------------------------------*/
+agg AS (
+    SELECT
+        p.p_rgnl_ntwk_id AS rgnl_ntwk_id,
+        COUNT(*) AS base_rows,
+
+        SUM(
+            CASE WHEN
+                ok_j_effdt_mand=1
+                AND ok_cp_type_mand=1
+                AND ok_cp_effdt_mand=1
+                AND ok_j_dir=1 AND ok_j_maxmbr=1 AND ok_j_minage=1 AND ok_j_maxage=1 AND ok_j_gender=1 AND ok_j_role=1
+                AND ok_rs_effdt=1 AND ok_rs_primary=1 AND ok_pn_spclty=1
+                AND ok_addr=1
+            THEN 1 ELSE 0 END
+        ) AS matching_rows,
+
+        /* Fail counts per rule */
+        SUM(CASE WHEN ok_j_effdt_mand=0 THEN 1 ELSE 0 END) AS fail_j_effdt_mand,
+        SUM(CASE WHEN ok_cp_type_mand=0 THEN 1 ELSE 0 END) AS fail_cp_type_mand,
+        SUM(CASE WHEN ok_cp_effdt_mand=0 THEN 1 ELSE 0 END) AS fail_cp_effdt_mand,
+
+        SUM(CASE WHEN ok_j_dir=0 THEN 1 ELSE 0 END) AS fail_j_dir,
+        SUM(CASE WHEN ok_j_maxmbr=0 THEN 1 ELSE 0 END) AS fail_j_maxmbr,
+        SUM(CASE WHEN ok_j_minage=0 THEN 1 ELSE 0 END) AS fail_j_minage,
+        SUM(CASE WHEN ok_j_maxage=0 THEN 1 ELSE 0 END) AS fail_j_maxage,
+        SUM(CASE WHEN ok_j_gender=0 THEN 1 ELSE 0 END) AS fail_j_gender,
+        SUM(CASE WHEN ok_j_role=0 THEN 1 ELSE 0 END) AS fail_j_role,
+
+        SUM(CASE WHEN ok_rs_effdt=0 THEN 1 ELSE 0 END) AS fail_rs_effdt,
+        SUM(CASE WHEN ok_rs_primary=0 THEN 1 ELSE 0 END) AS fail_rs_primary,
+        SUM(CASE WHEN ok_pn_spclty=0 THEN 1 ELSE 0 END) AS fail_pn_spclty,
+
+        SUM(CASE WHEN ok_addr=0 THEN 1 ELSE 0 END) AS fail_addr
+
+    FROM eval e
+    CROSS JOIN params p
+    GROUP BY p.p_rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   6) Overall audit row (ALWAYS one row)
+--------------------------------------------------*/
+overall AS (
+    SELECT
+        p.p_rgnl_ntwk_id AS rgnl_ntwk_id,
+        NVL(a.base_rows, 0) AS base_rows,
+        NVL(a.matching_rows, 0) AS matching_rows,
+        CASE WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass' ELSE 'Audit Fail' END AS audit_status,
+
+        CASE
+            WHEN NVL(a.base_rows, 0) = 0 THEN 'No rows after joins for ORG/IND/NETWORK (check IDs/linkage).'
+            WHEN NVL(a.matching_rows, 0) > 0 THEN NULL
+            ELSE 'Audit failed. Use FAIL_SUMMARY + ROW_FAIL_DUE_TO to identify failing filters.'
+        END AS fail_due_to,
+
+        CASE
+            WHEN NVL(a.base_rows, 0) = 0 THEN NULL
+            ELSE
+                'J_EFFDT=' || a.fail_j_effdt_mand ||
+                ', CP_TYPE=' || a.fail_cp_type_mand ||
+                ', CP_EFFDT=' || a.fail_cp_effdt_mand ||
+                ', J_DIR=' || a.fail_j_dir ||
+                ', J_MAX_MBR=' || a.fail_j_maxmbr ||
+                ', J_MIN_AGE=' || a.fail_j_minage ||
+                ', J_MAX_AGE=' || a.fail_j_maxage ||
+                ', J_GENDER=' || a.fail_j_gender ||
+                ', J_ROLE=' || a.fail_j_role ||
+                ', RS_EFFDT=' || a.fail_rs_effdt ||
+                ', RS_PRIMARY=' || a.fail_rs_primary ||
+                ', PN_SPCLTY=' || a.fail_pn_spclty ||
+                ', ADDRESS=' || a.fail_addr
+        END AS fail_summary
+    FROM params p
+    LEFT JOIN agg a
+        ON a.rgnl_ntwk_id = p.p_rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   7) Detail rows + per-row failure reason
+--------------------------------------------------*/
+detail AS (
+    SELECT
+        e.*,
+        RTRIM(
+            (CASE WHEN e.ok_j_effdt_mand=0 THEN 'J.RLTD_PADRS_NTWK_EFCTV_DT, ' END) ||
+            (CASE WHEN e.ok_cp_type_mand=0 THEN 'RC.CP_TYPE_CD, ' END) ||
+            (CASE WHEN e.ok_cp_effdt_mand=0 THEN 'RC.RLTD_PADRS_CP_EFCTV_DT, ' END) ||
+            (CASE WHEN e.ok_j_dir=0 THEN 'J.DIR_DSPLY_IND, ' END) ||
+            (CASE WHEN e.ok_j_maxmbr=0 THEN 'J.MAX_MBR_CNT, ' END) ||
+            (CASE WHEN e.ok_j_minage=0 THEN 'J.MIN_AGE_NBR, ' END) ||
+            (CASE WHEN e.ok_j_maxage=0 THEN 'J.MAX_AGE_NBR, ' END) ||
+            (CASE WHEN e.ok_j_gender=0 THEN 'J.PAT_GNDR_CD, ' END) ||
+            (CASE WHEN e.ok_j_role=0 THEN 'J.ROLE_CD, ' END) ||
+            (CASE WHEN e.ok_rs_effdt=0 THEN 'RS.RLTD_PADRS_NW_SPCLTY_EFCTV_DT, ' END) ||
+            (CASE WHEN e.ok_rs_primary=0 THEN 'RS.PRMRY_SPCLTY_IND, ' END) ||
+            (CASE WHEN e.ok_pn_spclty=0 THEN 'PN.SPCLTY_NM, ' END) ||
+            (CASE WHEN e.ok_addr=0 THEN 'FULL_ADDRESS, ' END)
+        , ', ') AS row_fail_due_to
+    FROM eval e
+)
+
+/* -------------------------------------------------
+   8) Final output: ALWAYS returns something
+--------------------------------------------------*/
+SELECT
+    d.*,
+    o.audit_status,
+    o.fail_due_to,
+    o.fail_summary,
+    o.base_rows,
+    o.matching_rows
+FROM overall o
+LEFT JOIN detail d
+    ON d.param_rgnl_ntwk_id = o.rgnl_ntwk_id;

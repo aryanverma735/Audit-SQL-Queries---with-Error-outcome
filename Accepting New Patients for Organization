@@ -1,0 +1,235 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+--------------------------------------------------*/
+params AS (
+    SELECT
+        /* Inputs */
+        '<[Accepting_New_Patients_Org_Prac_Adrs]>' AS full_addr,
+        '<[Accepting_New_Patients_Org_EID]>'       AS p_org_eid,
+        '<[Accepting_New_Patients_Org_Network_ID]>' AS p_network_id,
+        '<[Accepting_New_Patients_Org_Accepting_Patient_Type]>' AS p_cp_type_cd,
+        TO_DATE('<[Accepting_New_Patients_Org_Effective_Date]>', 'MM/DD/YYYY') AS p_eff_dt,
+
+        /* Normalized address */
+        REGEXP_REPLACE(UPPER('<[Accepting_New_Patients_Org_Prac_Adrs]>'), '[^A-Z0-9]+', '') AS full_addr_norm
+    FROM dual
+),
+
+/* -------------------------------------------------
+   2) Base dataset
+   - Keep only org + network restriction to stay performant
+   - Everything else becomes "rules"
+--------------------------------------------------*/
+base AS (
+    SELECT
+        K.MSTR_PROV_ID AS ORG_EID,
+        M.PADRS_TYPE_CD AS PADRS_TYPE_CD,
+
+        /* Address build (same as you wrote) */
+        (
+          SELECT LISTAGG(val, ', ') WITHIN GROUP (ORDER BY pos)
+          FROM (
+            SELECT 1 AS pos, NULLIF(TRIM(S.ADRS_LINE_1_TXT), '') AS val FROM dual
+            UNION ALL SELECT 2, NULLIF(TRIM(S.ADRS_LINE_2_TXT), '') FROM dual
+            UNION ALL SELECT 3, NULLIF(TRIM(S.ADRS_LINE_3_TXT), '') FROM dual
+            UNION ALL SELECT 4, NULLIF(TRIM(S.ADRS_CITY_NM), '') FROM dual
+            UNION ALL SELECT 5,
+              CASE
+                WHEN NVL(TRIM(S.POSTL_CD_ST_PRVNC_NM), '') IS NOT NULL
+                  OR NVL(TRIM(S.POSTL_CD), '') IS NOT NULL
+                THEN TRIM(
+                       NVL(TRIM(S.POSTL_CD_ST_PRVNC_NM), '') ||
+                       CASE
+                         WHEN NVL(TRIM(S.POSTL_CD_ST_PRVNC_NM), '') IS NOT NULL
+                          AND NVL(TRIM(S.POSTL_CD), '') IS NOT NULL
+                         THEN ' ' ELSE '' END ||
+                       NVL(TRIM(S.POSTL_CD), '')
+                     )
+                ELSE NULL
+              END
+            FROM dual
+          )
+          WHERE val IS NOT NULL
+        ) AS ADDRESS_FULL,
+
+        NW.RGNL_NTWK_ID,
+        XX.CP_TYPE_CD,
+        XX.POA_CP_EFCTV_DT,
+        XX.POA_CP_TRMNTN_DT
+
+    FROM SPSOWNER.RLTD_PADRS_NTWK J
+    JOIN SPSOWNER.RLTD_PADRS K
+        ON K.RLTD_PADRS_KEY = J.RLTD_PADRS_KEY
+    JOIN SPSOWNER.PROV PROV
+        ON PROV.MSTR_PROV_ID = K.MSTR_PROV_ID
+    JOIN SPSOWNER.POA M
+        ON M.POA_KEY = K.POA_KEY
+    JOIN SPSOWNER.POA_NTWK N
+        ON N.POA_NTWK_KEY = J.POA_NTWK_KEY
+    JOIN SPSOWNER.POA_NTWK_CP XX
+        ON N.POA_NTWK_KEY = XX.POA_NTWK_KEY
+    JOIN SPSOWNER.PROV_ORG_NTWK PON
+        ON PON.PROV_ORG_NTWK_KEY = N.PROV_ORG_NTWK_KEY
+    JOIN SPSOWNER.NTWK NW
+        ON PON.NTWK_KEY = NW.NTWK_KEY
+    JOIN SPSOWNER.STNDRDZD_ADRS S
+        ON M.SPS_STNDRDZD_ADRS_ID = S.SPS_STNDRDZD_ADRS_ID
+
+    /* These were in your query; kept to match original join path */
+    JOIN SPSOWNER.PROV_SPCLTY PS
+        ON PROV.MSTR_PROV_ID = PS.MSTR_PROV_ID
+    JOIN SPSOWNER.RLTD_PADRS_NTWK_CP PNC
+        ON PNC.RLTD_PADRS_NTWK_KEY = J.RLTD_PADRS_NTWK_KEY
+
+    CROSS JOIN params p
+    WHERE
+        /* Keep these restrictions in base (like earlier approach) */
+        PROV.MSTR_PROV_ID = p.p_org_eid
+        AND NW.RGNL_NTWK_ID = p.p_network_id
+),
+
+/* -------------------------------------------------
+   3) Evaluate each rule as a flag (1=pass, 0=fail)
+--------------------------------------------------*/
+eval AS (
+    SELECT
+        b.*,
+        p.full_addr,
+        p.full_addr_norm,
+
+        /* Normalized calculated address */
+        REGEXP_REPLACE(UPPER(b.ADDRESS_FULL), '[^A-Z0-9]+', '') AS addr_norm,
+
+        /* Rule flags */
+        CASE WHEN b.CP_TYPE_CD = p.p_cp_type_cd THEN 1 ELSE 0 END AS ok_cp_type,
+        CASE WHEN b.POA_CP_EFCTV_DT = p.p_eff_dt THEN 1 ELSE 0 END AS ok_eff_dt,
+
+        CASE
+          WHEN REGEXP_REPLACE(UPPER(b.ADDRESS_FULL), '[^A-Z0-9]+', '') = p.full_addr_norm
+          THEN 1 ELSE 0
+        END AS ok_addr
+
+    FROM base b
+    CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   4) Aggregate to compute overall pass/fail and fail counts
+--------------------------------------------------*/
+agg AS (
+    SELECT
+        p.p_network_id AS rgnl_ntwk_id,
+        COUNT(*) AS base_rows,
+
+        SUM(
+            CASE WHEN ok_cp_type=1 AND ok_eff_dt=1 AND ok_addr=1
+            THEN 1 ELSE 0 END
+        ) AS matching_rows,
+
+        /* Fail counts */
+        SUM(CASE WHEN ok_cp_type=0 THEN 1 ELSE 0 END) AS fail_cp_type,
+        SUM(CASE WHEN ok_eff_dt=0 THEN 1 ELSE 0 END) AS fail_eff_dt,
+        SUM(CASE WHEN ok_addr=0 THEN 1 ELSE 0 END) AS fail_addr
+
+    FROM eval e
+    CROSS JOIN params p
+    GROUP BY p.p_network_id
+),
+
+/* -------------------------------------------------
+   5) Which filters are "blocking" matches?
+   - A filter is blocking if no row passes it (pass_rows=0)
+--------------------------------------------------*/
+blocking AS (
+    SELECT
+        a.rgnl_ntwk_id,
+        LISTAGG(fail_field, ', ') WITHIN GROUP (ORDER BY fail_field) AS blocking_filters
+    FROM (
+        SELECT rgnl_ntwk_id, 'XX.CP_TYPE_CD' AS fail_field
+        FROM agg
+        WHERE base_rows > 0 AND (base_rows - fail_cp_type) = 0
+
+        UNION ALL
+        SELECT rgnl_ntwk_id, 'XX.POA_CP_EFCTV_DT' AS fail_field
+        FROM agg
+        WHERE base_rows > 0 AND (base_rows - fail_eff_dt) = 0
+
+        UNION ALL
+        SELECT rgnl_ntwk_id, 'ADDRESS_FULL' AS fail_field
+        FROM agg
+        WHERE base_rows > 0 AND (base_rows - fail_addr) = 0
+    ) x
+    JOIN agg a
+        ON a.rgnl_ntwk_id = x.rgnl_ntwk_id
+    GROUP BY a.rgnl_ntwk_id
+),
+
+/* -------------------------------------------------
+   6) Overall audit row (ALWAYS 1 row)
+--------------------------------------------------*/
+overall AS (
+    SELECT
+        p.p_network_id AS rgnl_ntwk_id,
+        NVL(a.base_rows, 0) AS base_rows,
+        NVL(a.matching_rows, 0) AS matching_rows,
+
+        CASE
+          WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass'
+          ELSE 'Audit Fail'
+        END AS audit_status,
+
+        CASE
+          WHEN NVL(a.base_rows, 0) = 0 THEN
+            'No rows after base restrictions (check ORG_EID / Network ID).'
+          WHEN NVL(a.matching_rows, 0) > 0 THEN
+            NULL
+          ELSE
+            NVL(b.blocking_filters,
+                'Multiple filters failing together (see FAIL_SUMMARY + ROW_FAIL_DUE_TO).')
+        END AS fail_due_to,
+
+        CASE
+          WHEN NVL(a.base_rows, 0) = 0 THEN NULL
+          ELSE
+            'CP_TYPE_FAIL=' || a.fail_cp_type ||
+            ', EFF_DT_FAIL=' || a.fail_eff_dt ||
+            ', ADDRESS_FAIL=' || a.fail_addr
+        END AS fail_summary
+
+    FROM params p
+    LEFT JOIN agg a
+        ON a.rgnl_ntwk_id = p.p_network_id
+    LEFT JOIN blocking b
+        ON b.rgnl_ntwk_id = p.p_network_id
+),
+
+/* -------------------------------------------------
+   7) Detail rows + per-row failure reason
+--------------------------------------------------*/
+detail AS (
+    SELECT
+        e.*,
+        RTRIM(
+            (CASE WHEN e.ok_cp_type=0 THEN 'XX.CP_TYPE_CD, ' END) ||
+            (CASE WHEN e.ok_eff_dt=0 THEN 'XX.POA_CP_EFCTV_DT, ' END) ||
+            (CASE WHEN e.ok_addr=0 THEN 'ADDRESS_FULL, ' END)
+        , ', ') AS row_fail_due_to
+    FROM eval e
+)
+
+/* -------------------------------------------------
+   8) Final output: ALWAYS returns something
+   - If base rows exist: returns all base rows + audit columns
+   - If no base rows: returns one row with NULL details + audit fail message
+--------------------------------------------------*/
+SELECT
+    d.*,
+    o.audit_status,
+    o.fail_due_to,
+    o.fail_summary,
+    o.base_rows,
+    o.matching_rows
+FROM overall o
+LEFT JOIN detail d
+    ON 1 = 1;

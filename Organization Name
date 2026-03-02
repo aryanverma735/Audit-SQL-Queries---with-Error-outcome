@@ -1,0 +1,110 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+--------------------------------------------------*/
+params AS (
+  SELECT
+    '1102228004' AS p_mstr_prov_id,
+    'North Central Health Care Youth Behvioral Health' AS p_org_name
+  FROM dual
+),
+
+/* -------------------------------------------------
+   2) Base: fetch row(s) by EID only
+--------------------------------------------------*/
+base AS (
+  SELECT p.*
+  FROM PROV p
+  CROSS JOIN params x
+  WHERE p.MSTR_PROV_ID = x.p_mstr_prov_id
+),
+
+/* -------------------------------------------------
+   3) Evaluate: rule flags
+--------------------------------------------------*/
+eval AS (
+  SELECT
+    b.*,
+    x.p_mstr_prov_id,
+    x.p_org_name,
+
+    /* Rule: Org name matches (case-insensitive) */
+    CASE
+      WHEN UPPER(b.PROV_ORG_NM) = UPPER(x.p_org_name) THEN 1
+      ELSE 0
+    END AS ok_org_name
+  FROM base b
+  CROSS JOIN params x
+),
+
+/* -------------------------------------------------
+   4) Aggregate for overall audit  (FIXED)
+   - No scalar subquery in SELECT.
+   - We GROUP BY the param value (1 row anyway).
+--------------------------------------------------*/
+agg AS (
+  SELECT
+    x.p_mstr_prov_id AS mstr_prov_id,
+    COUNT(*) AS base_rows,
+    SUM(CASE WHEN e.ok_org_name = 1 THEN 1 ELSE 0 END) AS matching_rows,
+    SUM(CASE WHEN e.ok_org_name = 0 THEN 1 ELSE 0 END) AS fail_org_name
+  FROM eval e
+  CROSS JOIN params x
+  GROUP BY x.p_mstr_prov_id
+),
+
+/* -------------------------------------------------
+   5) Overall row (ALWAYS 1 row)
+--------------------------------------------------*/
+overall AS (
+  SELECT
+    p.p_mstr_prov_id AS mstr_prov_id,
+    p.p_org_name     AS expected_org_name,
+
+    NVL(a.base_rows, 0) AS base_rows,
+    NVL(a.matching_rows, 0) AS matching_rows,
+
+    CASE WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass' ELSE 'Audit Fail' END AS audit_status,
+
+    CASE
+      WHEN NVL(a.base_rows, 0) = 0 THEN 'MSTR_PROV_ID not found in PROV'
+      WHEN NVL(a.matching_rows, 0) > 0 THEN NULL
+      ELSE 'PROV_ORG_NM mismatch'
+    END AS fail_due_to,
+
+    CASE
+      WHEN NVL(a.base_rows, 0) = 0 THEN NULL
+      ELSE 'ORG_NAME_FAIL=' || a.fail_org_name
+    END AS fail_summary
+
+  FROM params p
+  LEFT JOIN agg a
+    ON a.mstr_prov_id = p.p_mstr_prov_id
+),
+
+/* -------------------------------------------------
+   6) Detail rows + per-row failure reason
+--------------------------------------------------*/
+detail AS (
+  SELECT
+    e.*,
+    RTRIM(
+      (CASE WHEN e.ok_org_name = 0 THEN 'PROV_ORG_NM, ' END)
+    , ', ') AS row_fail_due_to
+  FROM eval e
+)
+
+/* -------------------------------------------------
+   7) Final output: ALWAYS returns something
+--------------------------------------------------*/
+SELECT
+  d.*,
+  o.audit_status,
+  o.fail_due_to,
+  o.fail_summary,
+  o.base_rows,
+  o.matching_rows,
+  o.expected_org_name
+FROM overall o
+LEFT JOIN detail d
+  ON 1 = 1;

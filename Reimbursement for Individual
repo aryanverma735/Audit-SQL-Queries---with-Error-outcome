@@ -1,0 +1,217 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+--------------------------------------------------*/
+params AS (
+  SELECT
+    /* Address to audit */
+    '100 Wood Duck Ln,Williamstown,WV,26187' AS full_addr,
+    REGEXP_REPLACE(LOWER('100 Wood Duck Ln,Williamstown,WV,26187'), '[[:space:]]+|,|-|\.', '') AS full_addr_norm,
+
+    /* Linkage restriction (like first query) */
+    '1100013656' AS p_ind_mstr_prov_id,
+    '1105762100' AS p_org_mstr_prov_id,
+
+    /* Reimbursement / directory expectations */
+    'MWPPB100' AS p_ra_1_id,
+    'Y'        AS p_dir_ind,
+    TO_DATE('12/10/2025','MM/DD/YYYY') AS p_ra_eff_dt
+
+  FROM dual
+),
+/* -------------------------------------------------
+   2) Base dataset (joins + ONLY core restrictions)
+   - Restrict by IND + ORG using RLTD_PADRS (linkage)
+   - LEFT JOIN reimbursement so missing rows remain visible
+--------------------------------------------------*/
+base AS (
+  SELECT DISTINCT
+      /* Linkage identifiers */
+      L_IND.MSTR_PROV_ID  AS IND_MSTR_PROV_ID,
+      L_ORG.MSTR_PROV_ID  AS ORG_EID,
+      K.RLTD_PADRS_KEY,
+      K.POA_KEY,
+
+      /* Reimbursement fields (may be NULL if no row in POA_RA_W) */
+      PW.RA_1_ID,
+      PW.DIR_IND,
+      PW.ACPTG_NEW_PATS_IND,
+      PW.RA_EFCTV_DT,
+      PW.PROV_WTHLD_EFCTV_DT,
+      PW.RA_SOR_CD,
+      PW.RA_1_TYPE_CD,
+      PW.CNTRCT_TFD_NBR,
+
+      /* === Concatenated address (same as your 2nd query) === */
+      RTRIM(
+          NVL2(NULLIF(TRIM(S_DIR.ADRS_LINE_1_TXT), ''),
+               TRIM(S_DIR.ADRS_LINE_1_TXT) || ',', ''
+          ) ||
+          NVL2(NULLIF(TRIM(S_DIR.ADRS_LINE_2_TXT), ''),
+               TRIM(S_DIR.ADRS_LINE_2_TXT) || ',', ''
+          ) ||
+          NVL2(NULLIF(TRIM(S_DIR.ADRS_LINE_3_TXT), ''),
+               TRIM(S_DIR.ADRS_LINE_3_TXT) || ',', ''
+          ) ||
+          NVL2(NULLIF(TRIM(S_DIR.ADRS_CITY_NM), ''),
+               TRIM(S_DIR.ADRS_CITY_NM) || ',', ''
+          ) ||
+          NVL2(NULLIF(TRIM(S_DIR.POSTL_CD_ST_PRVNC_NM), ''),
+               TRIM(S_DIR.POSTL_CD_ST_PRVNC_NM) || ',', ''
+          ) ||
+          CASE
+              WHEN NULLIF(TRIM(S_DIR.POSTL_CD), '') IS NOT NULL
+              THEN TRIM(S_DIR.POSTL_CD)
+              ELSE NULL
+          END
+      , ',') AS FULL_ADDRESS
+
+  FROM SPSOWNER.RLTD_PADRS K
+
+  /*  Linkage: ORG + IND */
+  JOIN SPSOWNER.PROV L_ORG
+    ON L_ORG.MSTR_PROV_ID = K.MSTR_PROV_ID
+  JOIN SPSOWNER.PROV L_IND
+    ON L_IND.MSTR_PROV_ID = K.RLTD_MSTR_PROV_ID
+
+  /* POA via linkage */
+  JOIN SPSOWNER.POA PO
+    ON PO.POA_KEY = K.POA_KEY
+
+  JOIN SPSOWNER.STNDRDZD_ADRS S_DIR
+    ON S_DIR.SPS_STNDRDZD_ADRS_ID = PO.SPS_STNDRDZD_ADRS_ID
+
+  /*  Reimbursement (LEFT JOIN for diagnostics) */
+  LEFT JOIN SPSOWNER.POA_RA_W PW
+    ON PW.POA_KEY = PO.POA_KEY
+
+  CROSS JOIN params pr
+  WHERE
+      L_IND.MSTR_PROV_ID = pr.p_ind_mstr_prov_id
+  AND L_ORG.MSTR_PROV_ID = pr.p_org_mstr_prov_id
+),
+
+/* -------------------------------------------------
+   3) Evaluate rules (like first query style)
+--------------------------------------------------*/
+eval AS (
+  SELECT
+    b.*,
+
+    /* Normalize address (same as your EXISTS) */
+    REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')),
+                   '[[:space:]]+|,|-|\.', '') AS addr_norm,
+
+    /* Address match */
+    CASE
+      WHEN REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')),
+                          '[[:space:]]+|,|-|\.', '') = pr.full_addr_norm
+      THEN 1 ELSE 0
+    END AS ok_addr,
+
+    /* Reimbursement checks */
+    CASE WHEN b.RA_1_ID = pr.p_ra_1_id THEN 1 ELSE 0 END AS ok_ra_1_id,
+    CASE WHEN b.DIR_IND = pr.p_dir_ind THEN 1 ELSE 0 END AS ok_dir_ind,
+    CASE WHEN TRUNC(b.RA_EFCTV_DT) = TRUNC(pr.p_ra_eff_dt) THEN 1 ELSE 0 END AS ok_ra_effdt,
+
+    /* Score used to pick representative row */
+    ( CASE
+        WHEN REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')),
+                            '[[:space:]]+|,|-|\.', '') = pr.full_addr_norm
+        THEN 1 ELSE 0
+      END
+    + CASE WHEN b.RA_1_ID = pr.p_ra_1_id THEN 1 ELSE 0 END
+    + CASE WHEN b.DIR_IND = pr.p_dir_ind THEN 1 ELSE 0 END
+    + CASE WHEN TRUNC(b.RA_EFCTV_DT) = TRUNC(pr.p_ra_eff_dt) THEN 1 ELSE 0 END
+    ) AS pass_score
+
+  FROM base b
+  CROSS JOIN params pr
+),
+
+/* -------------------------------------------------
+   4) Aggregate (single audit scope)
+--------------------------------------------------*/
+agg AS (
+  SELECT
+    COUNT(*) AS base_rows,
+    SUM(
+      CASE WHEN ok_addr=1 AND ok_ra_1_id=1 AND ok_dir_ind=1 AND ok_ra_effdt=1
+      THEN 1 ELSE 0 END
+    ) AS matching_rows,
+
+    /* Fail counts for diagnostics */
+    SUM(CASE WHEN ok_addr=0     THEN 1 ELSE 0 END) AS fail_addr,
+    SUM(CASE WHEN ok_ra_1_id=0  THEN 1 ELSE 0 END) AS fail_ra_1_id,
+    SUM(CASE WHEN ok_dir_ind=0  THEN 1 ELSE 0 END) AS fail_dir_ind,
+    SUM(CASE WHEN ok_ra_effdt=0 THEN 1 ELSE 0 END) AS fail_ra_effdt
+  FROM eval
+),
+
+/* -------------------------------------------------
+   5) Pick ONE representative row (best match)
+--------------------------------------------------*/
+pick_one AS (
+  SELECT *
+  FROM (
+    SELECT
+      e.*,
+      RTRIM(
+        (CASE WHEN e.ok_addr=0     THEN 'ADDRESS, ' END) ||
+        (CASE WHEN e.ok_ra_1_id=0  THEN 'RA_1_ID, ' END) ||
+        (CASE WHEN e.ok_dir_ind=0  THEN 'DIR_IND, ' END) ||
+        (CASE WHEN e.ok_ra_effdt=0 THEN 'RA_EFCTV_DT, ' END)
+      , ', ') AS row_fail_due_to,
+
+      ROW_NUMBER() OVER (
+        ORDER BY
+          e.pass_score DESC,
+          e.RA_EFCTV_DT DESC NULLS LAST,
+          e.RLTD_PADRS_KEY DESC
+      ) AS rn
+    FROM eval e
+  )
+  WHERE rn = 1
+)
+
+/* -------------------------------------------------
+   6) Final output
+--------------------------------------------------*/
+SELECT
+  a.base_rows,
+  a.matching_rows,
+
+  CASE
+    WHEN a.base_rows = 0 THEN 'Audit Fail'
+    WHEN a.matching_rows > 0 THEN 'Audit Pass'
+    ELSE 'Audit Fail'
+  END AS audit_result,
+
+  CASE
+    WHEN a.base_rows = 0 THEN 'No rows found for this IND/ORG linkage (RLTD_PADRS).'
+    WHEN a.matching_rows > 0 THEN NULL
+    ELSE 'One or more filters failing (see FAIL_SUMMARY + ROW_FAIL_DUE_TO).'
+  END AS fail_due_to,
+
+  /* Helpful summary */
+  'ADDR_FAIL=' || a.fail_addr ||
+  ', RA_1_ID_FAIL=' || a.fail_ra_1_id ||
+  ', DIR_IND_FAIL=' || a.fail_dir_ind ||
+  ', RA_EFFDT_FAIL=' || a.fail_ra_effdt AS fail_summary,
+
+  /* Representative row details */
+  p.IND_MSTR_PROV_ID,
+  p.ORG_EID,
+  p.RLTD_PADRS_KEY,
+  p.POA_KEY,
+  p.FULL_ADDRESS,
+  p.RA_1_ID,
+  p.DIR_IND,
+  p.RA_EFCTV_DT,
+  p.ACPTG_NEW_PATS_IND,
+  p.pass_score,
+  p.row_fail_due_to
+
+FROM agg a
+LEFT JOIN pick_one p
+  ON 1 = 1;

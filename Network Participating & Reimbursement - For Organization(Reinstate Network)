@@ -1,0 +1,249 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+--------------------------------------------------*/
+params AS (
+  SELECT
+    /* Provider */
+    '1102193922' AS p_mstr_prov_id,
+
+    /* Networks you want output for (comma-separated) */
+    '000000000001BPA3' AS p_network_list,  -- e.g. '000000000001BPA3,ABCDEF'
+
+    /* POA_NTWK effective date filter */
+    TO_DATE('01/01/2018','MM/DD/YYYY') AS p_poa_ntwk_eff_dt,
+
+    /* Expected address */
+    REGEXP_REPLACE(
+      LOWER('2215 E Clairemont Ave, Ste 5, Eau Claire, WI, 54701'),
+      '[[:space:]]+', ' '
+    ) AS p_addr_norm
+  FROM dual
+),
+
+/* -------------------------------------------------
+   2) Expand network list into rows
+--------------------------------------------------*/
+network_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(p.p_network_list, '[^,]+', 1, LEVEL)) AS rgnl_ntwk_id
+  FROM params p
+  CONNECT BY REGEXP_SUBSTR(p.p_network_list, '[^,]+', 1, LEVEL) IS NOT NULL
+),
+
+/* -------------------------------------------------
+   3) Base dataset
+   - Restrict ONLY by provider + provided networks
+   - Keep joins as LEFT where possible so missing data can be diagnosed
+--------------------------------------------------*/
+base AS (
+  SELECT DISTINCT
+    L.MSTR_PROV_ID,
+    NW.RGNL_NTWK_ID,
+
+    /* Useful keys for debugging / deterministic pick-one */
+    M_DIR.POA_KEY,
+    N.POA_NTWK_KEY,
+    N.PROV_ORG_NTWK_KEY,
+    PON.NTWK_KEY,
+    S.SPS_STNDRDZD_ADRS_ID,
+
+    /* Condition column in your original WHERE */
+    N.POA_NTWK_EFCTV_DT,
+
+    /* Optional: contact mechanism name (since you join CD_VAL CN) */
+    CN.CD_VAL_NM AS CNTCT_DLVRY_MCHNSM_NM,
+
+    /* Optional: CP fields (since you join POA_NTWK_CP NN) */
+    NN.POA_NTWK_CP_KEY,
+    NN.CP_TYPE_CD,
+    NN.POA_CP_EFCTV_DT,
+    NN.POA_CP_TRMNTN_DT,
+
+    /* === FULL_ADDRESS (same logic as yours) === */
+    RTRIM(
+      NVL2(NULLIF(TRIM(S.ADRS_LINE_1_TXT), ''), TRIM(S.ADRS_LINE_1_TXT) || ', ', '') ||
+      NVL2(NULLIF(TRIM(S.ADRS_LINE_2_TXT), ''), TRIM(S.ADRS_LINE_2_TXT) || ', ', '') ||
+      NVL2(NULLIF(TRIM(S.ADRS_LINE_3_TXT), ''), TRIM(S.ADRS_LINE_3_TXT) || ', ', '') ||
+      NVL2(NULLIF(TRIM(S.ADRS_CITY_NM), ''),     TRIM(S.ADRS_CITY_NM) || ', ', '') ||
+      NVL2(NULLIF(TRIM(S.POSTL_CD_ST_PRVNC_NM), ''), TRIM(S.POSTL_CD_ST_PRVNC_NM) || ', ', '') ||
+      NVL2(NULLIF(TRIM(S.POSTL_CD), ''), TRIM(S.POSTL_CD), '')
+    , ' ,') AS FULL_ADDRESS
+
+  FROM SPSOWNER.PROV L
+  JOIN SPSOWNER.POA M_DIR
+    ON M_DIR.MSTR_PROV_ID = L.MSTR_PROV_ID
+
+  JOIN POA_NTWK N
+    ON N.POA_KEY = M_DIR.POA_KEY
+
+  /* LEFT JOIN for diagnosis (missing CP still keeps the row) */
+  LEFT JOIN POA_NTWK_CP NN
+    ON NN.POA_NTWK_KEY = N.POA_NTWK_KEY
+
+  /* LEFT JOIN for diagnosis (missing contact still keeps the row) */
+  LEFT JOIN POA_CNTCT PC
+    ON PC.POA_KEY = M_DIR.POA_KEY
+  LEFT JOIN CD_VAL CN
+    ON PC.CNTCT_DLVRY_MCHNSM_TYPE_CD = CN.CD_VAL_CD
+
+  JOIN PROV_ORG_NTWK PON
+    ON PON.PROV_ORG_NTWK_KEY = N.PROV_ORG_NTWK_KEY
+
+  JOIN NTWK NW
+    ON NW.NTWK_KEY = PON.NTWK_KEY
+
+  JOIN STNDRDZD_ADRS S
+    ON S.SPS_STNDRDZD_ADRS_ID = M_DIR.SPS_STNDRDZD_ADRS_ID
+
+  CROSS JOIN params p
+  JOIN network_list nl
+    ON nl.rgnl_ntwk_id = NW.RGNL_NTWK_ID
+
+  WHERE
+    L.MSTR_PROV_ID = p.p_mstr_prov_id
+),
+
+/* -------------------------------------------------
+   4) Evaluate rule flags per row + pass_score
+--------------------------------------------------*/
+eval AS (
+  SELECT
+    b.*,
+
+    /* normalize address exactly like your final comparison */
+    REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')), '[[:space:]]+', ' ') AS addr_norm,
+
+    /* Rule: POA_NTWK_EFCTV_DT */
+    CASE WHEN b.POA_NTWK_EFCTV_DT = p.p_poa_ntwk_eff_dt THEN 1 ELSE 0 END AS ok_effdt,
+
+    /* Rule: FULL_ADDRESS match */
+    CASE
+      WHEN REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')), '[[:space:]]+', ' ') = p.p_addr_norm
+      THEN 1 ELSE 0
+    END AS ok_addr,
+
+    /* Score used to pick representative row */
+    ( CASE WHEN b.POA_NTWK_EFCTV_DT = p.p_poa_ntwk_eff_dt THEN 1 ELSE 0 END
+    + CASE WHEN REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')), '[[:space:]]+', ' ') = p.p_addr_norm THEN 1 ELSE 0 END
+    ) AS pass_score
+
+  FROM base b
+  CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   5) Aggregate per network (1 row per network)
+--------------------------------------------------*/
+agg AS (
+  SELECT
+    e.RGNL_NTWK_ID,
+    COUNT(*) AS base_rows,
+    SUM(CASE WHEN ok_effdt=1 AND ok_addr=1 THEN 1 ELSE 0 END) AS matching_rows,
+
+    SUM(CASE WHEN ok_effdt=0 THEN 1 ELSE 0 END) AS fail_effdt,
+    SUM(CASE WHEN ok_addr=0 THEN 1 ELSE 0 END) AS fail_addr
+  FROM eval e
+  GROUP BY e.RGNL_NTWK_ID
+),
+
+/* -------------------------------------------------
+   6) Blocking filters per network (no row passes the rule)
+--------------------------------------------------*/
+blocking AS (
+  SELECT
+    a.RGNL_NTWK_ID,
+    LISTAGG(fail_field, ', ') WITHIN GROUP (ORDER BY fail_field) AS blocking_filters
+  FROM (
+    SELECT rgnl_ntwk_id, 'N.POA_NTWK_EFCTV_DT' AS fail_field
+    FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_effdt) = 0
+
+    UNION ALL
+    SELECT rgnl_ntwk_id, 'FULL_ADDRESS' AS fail_field
+    FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_addr) = 0
+  ) x
+  JOIN agg a
+    ON a.RGNL_NTWK_ID = x.rgnl_ntwk_id
+  GROUP BY a.RGNL_NTWK_ID
+),
+
+/* -------------------------------------------------
+   7) Pick ONE representative row per network
+--------------------------------------------------*/
+pick_one AS (
+  SELECT *
+  FROM (
+    SELECT
+      e.*,
+      RTRIM(
+        (CASE WHEN e.ok_effdt=0 THEN 'N.POA_NTWK_EFCTV_DT, ' END) ||
+        (CASE WHEN e.ok_addr=0 THEN 'FULL_ADDRESS, ' END)
+      , ', ') AS row_fail_due_to,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY e.RGNL_NTWK_ID
+        ORDER BY
+          e.pass_score DESC,
+          e.POA_NTWK_EFCTV_DT DESC NULLS LAST,
+          e.POA_NTWK_KEY DESC
+      ) AS rn
+    FROM eval e
+  )
+  WHERE rn = 1
+)
+
+/* -------------------------------------------------
+   8) Final output: EXACTLY 1 row per provided network
+--------------------------------------------------*/
+SELECT
+  nl.rgnl_ntwk_id,
+
+  NVL(a.base_rows, 0) AS base_rows,
+  NVL(a.matching_rows, 0) AS matching_rows,
+
+  CASE WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass' ELSE 'Audit Fail' END AS audit_status,
+
+  CASE
+    WHEN a.rgnl_ntwk_id IS NULL THEN 'No rows found for this network under provider restriction.'
+    WHEN NVL(a.matching_rows, 0) > 0 THEN NULL
+    ELSE NVL(b.blocking_filters, 'Multiple filters failing together (see FAIL_SUMMARY + ROW_FAIL_DUE_TO).')
+  END AS fail_due_to,
+
+  CASE
+    WHEN a.rgnl_ntwk_id IS NULL THEN NULL
+    ELSE
+      'EFFDT_FAIL=' || a.fail_effdt ||
+      ', ADDR_FAIL=' || a.fail_addr
+  END AS fail_summary,
+
+  /* Representative row values (all selected columns) */
+  p.MSTR_PROV_ID,
+  p.POA_KEY,
+  p.POA_NTWK_KEY,
+  p.PROV_ORG_NTWK_KEY,
+  p.NTWK_KEY,
+  p.SPS_STNDRDZD_ADRS_ID,
+
+  p.POA_NTWK_EFCTV_DT,
+  p.CNTCT_DLVRY_MCHNSM_NM,
+
+  p.POA_NTWK_CP_KEY,
+  p.CP_TYPE_CD,
+  p.POA_CP_EFCTV_DT,
+  p.POA_CP_TRMNTN_DT,
+
+  p.FULL_ADDRESS,
+
+  /* Debug helpers */
+  p.pass_score,
+  p.row_fail_due_to
+
+FROM network_list nl
+LEFT JOIN agg a
+  ON a.rgnl_ntwk_id = nl.rgnl_ntwk_id
+LEFT JOIN blocking b
+  ON b.rgnl_ntwk_id = nl.rgnl_ntwk_id
+LEFT JOIN pick_one p
+  ON p.rgnl_ntwk_id = nl.rgnl_ntwk_id
+ORDER BY nl.rgnl_ntwk_id;

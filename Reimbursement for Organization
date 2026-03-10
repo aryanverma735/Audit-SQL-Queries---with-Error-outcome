@@ -1,0 +1,232 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+   - You can pass multiple providers as comma-separated list
+--------------------------------------------------*/
+params AS (
+  SELECT
+    /* Inputs */
+    '1000084742' AS p_prov_list,              -- e.g. '1000084742,1000000001'
+    'MWVP0057'   AS p_ra_1_id,
+    'Y'          AS p_dir_ind,
+    TO_DATE('01/01/2009','MM/DD/YYYY') AS p_ra_eff_dt,
+
+    /* Address expected */
+    '376 Wv Highway 5 E, Glenville, WV, 26351' AS p_addr,
+    REGEXP_REPLACE(LOWER('376 Wv Highway 5 E, Glenville, WV, 26351'),
+                   '[[:space:]]+|,|-|\.','') AS p_addr_norm
+  FROM dual
+),
+
+/* -------------------------------------------------
+   2) Expand provider list into rows
+--------------------------------------------------*/
+prov_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(p.p_prov_list, '[^,]+', 1, LEVEL)) AS mstr_prov_id
+  FROM params p
+  CONNECT BY REGEXP_SUBSTR(p.p_prov_list, '[^,]+', 1, LEVEL) IS NOT NULL
+),
+
+/* -------------------------------------------------
+   3) Base dataset
+   - Keep only provider restriction here so rows remain visible for diagnosis
+--------------------------------------------------*/
+base AS (
+  SELECT
+    P.MSTR_PROV_ID,
+    PO.POA_KEY,
+    PW.RA_1_ID,
+    PW.DIR_IND,
+    PW.ACPTG_NEW_PATS_IND,
+    PW.RA_EFCTV_DT,
+    PW.PROV_WTHLD_EFCTV_DT,
+    PW.RA_SOR_CD,
+    PW.RA_1_TYPE_CD,
+    PW.CNTRCT_TFD_NBR,
+
+    /* === Concatenated address from S_DIR === */
+    RTRIM(
+      NVL2(NULLIF(TRIM(S_DIR.ADRS_LINE_1_TXT), ''), TRIM(S_DIR.ADRS_LINE_1_TXT) || ',', '') ||
+      NVL2(NULLIF(TRIM(S_DIR.ADRS_LINE_2_TXT), ''), TRIM(S_DIR.ADRS_LINE_2_TXT) || ',', '') ||
+      NVL2(NULLIF(TRIM(S_DIR.ADRS_LINE_3_TXT), ''), TRIM(S_DIR.ADRS_LINE_3_TXT) || ',', '') ||
+      NVL2(NULLIF(TRIM(S_DIR.ADRS_CITY_NM), ''),     TRIM(S_DIR.ADRS_CITY_NM) || ',', '') ||
+      NVL2(NULLIF(TRIM(S_DIR.POSTL_CD_ST_PRVNC_NM), ''), TRIM(S_DIR.POSTL_CD_ST_PRVNC_NM) || ',', '') ||
+      CASE
+        WHEN NULLIF(TRIM(S_DIR.POSTL_CD), '') IS NOT NULL THEN TRIM(S_DIR.POSTL_CD)
+        ELSE NULL
+      END
+    , ',') AS FULL_ADDRESS
+
+  FROM PROV P
+  JOIN POA PO
+    ON P.MSTR_PROV_ID = PO.MSTR_PROV_ID
+  JOIN POA_RA_W PW
+    ON PW.POA_KEY = PO.POA_KEY
+  JOIN STNDRDZD_ADRS S_DIR
+    ON S_DIR.SPS_STNDRDZD_ADRS_ID = PO.SPS_STNDRDZD_ADRS_ID
+
+  /* Restrict only to input providers */
+  JOIN prov_list pl
+    ON pl.mstr_prov_id = P.MSTR_PROV_ID
+),
+
+/* -------------------------------------------------
+   4) Evaluate rules (1 pass, 0 fail) + pass_score
+--------------------------------------------------*/
+eval AS (
+  SELECT
+    b.*,
+
+    /* Normalize FULL_ADDRESS exactly like your audit */
+    REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')), '[[:space:]]+|,|-|\.','') AS full_addr_norm,
+
+    /* Rule flags */
+    CASE WHEN b.RA_1_ID = p.p_ra_1_id THEN 1 ELSE 0 END AS ok_ra_1_id,
+    CASE WHEN b.DIR_IND = p.p_dir_ind THEN 1 ELSE 0 END AS ok_dir_ind,
+    CASE WHEN TRUNC(b.RA_EFCTV_DT) = p.p_ra_eff_dt THEN 1 ELSE 0 END AS ok_ra_effdt,
+
+    CASE
+      WHEN REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')), '[[:space:]]+|,|-|\.','') = p.p_addr_norm
+      THEN 1 ELSE 0
+    END AS ok_addr,
+
+    /* Score for picking representative row */
+    ( CASE WHEN b.RA_1_ID = p.p_ra_1_id THEN 1 ELSE 0 END
+    + CASE WHEN b.DIR_IND = p.p_dir_ind THEN 1 ELSE 0 END
+    + CASE WHEN TRUNC(b.RA_EFCTV_DT) = p.p_ra_eff_dt THEN 1 ELSE 0 END
+    + CASE WHEN REGEXP_REPLACE(LOWER(NVL(b.FULL_ADDRESS, '')), '[[:space:]]+|,|-|\.','') = p.p_addr_norm THEN 1 ELSE 0 END
+    ) AS pass_score
+
+  FROM base b
+  CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   5) Aggregate per provider (1 row per provider)
+--------------------------------------------------*/
+agg AS (
+  SELECT
+    e.MSTR_PROV_ID,
+    COUNT(*) AS base_rows,
+    SUM(CASE WHEN ok_ra_1_id=1 AND ok_dir_ind=1 AND ok_ra_effdt=1 AND ok_addr=1 THEN 1 ELSE 0 END) AS matching_rows,
+
+    /* Fail counts */
+    SUM(CASE WHEN ok_ra_1_id=0 THEN 1 ELSE 0 END) AS fail_ra_1_id,
+    SUM(CASE WHEN ok_dir_ind=0 THEN 1 ELSE 0 END) AS fail_dir_ind,
+    SUM(CASE WHEN ok_ra_effdt=0 THEN 1 ELSE 0 END) AS fail_ra_effdt,
+    SUM(CASE WHEN ok_addr=0 THEN 1 ELSE 0 END) AS fail_addr
+  FROM eval e
+  GROUP BY e.MSTR_PROV_ID
+),
+
+/* -------------------------------------------------
+   6) Blocking filters per provider (no row passes the rule)
+--------------------------------------------------*/
+blocking AS (
+  SELECT
+    a.mstr_prov_id,
+    LISTAGG(fail_field, ', ') WITHIN GROUP (ORDER BY fail_field) AS blocking_filters
+  FROM (
+    SELECT mstr_prov_id, 'PW.RA_1_ID' AS fail_field
+    FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_ra_1_id) = 0
+
+    UNION ALL
+    SELECT mstr_prov_id, 'PW.DIR_IND'
+    FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_dir_ind) = 0
+
+    UNION ALL
+    SELECT mstr_prov_id, 'TRUNC(PW.RA_EFCTV_DT)'
+    FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_ra_effdt) = 0
+
+    UNION ALL
+    SELECT mstr_prov_id, 'FULL_ADDRESS'
+    FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_addr) = 0
+  ) x
+  JOIN agg a
+    ON a.mstr_prov_id = x.mstr_prov_id
+  GROUP BY a.mstr_prov_id
+),
+
+/* -------------------------------------------------
+   7) Pick ONE representative row per provider
+--------------------------------------------------*/
+pick_one AS (
+  SELECT *
+  FROM (
+    SELECT
+      e.*,
+
+      RTRIM(
+        (CASE WHEN e.ok_ra_1_id=0 THEN 'PW.RA_1_ID, ' END) ||
+        (CASE WHEN e.ok_dir_ind=0 THEN 'PW.DIR_IND, ' END) ||
+        (CASE WHEN e.ok_ra_effdt=0 THEN 'PW.RA_EFCTV_DT, ' END) ||
+        (CASE WHEN e.ok_addr=0 THEN 'FULL_ADDRESS, ' END)
+      , ', ') AS row_fail_due_to,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY e.MSTR_PROV_ID
+        ORDER BY
+          e.pass_score DESC,
+          e.RA_EFCTV_DT DESC NULLS LAST,
+          e.POA_KEY DESC
+      ) AS rn
+    FROM eval e
+  )
+  WHERE rn = 1
+)
+
+/* -------------------------------------------------
+   8) Final output: EXACTLY 1 row per provided provider
+--------------------------------------------------*/
+SELECT
+  pl.mstr_prov_id,
+
+  NVL(a.base_rows, 0) AS base_rows,
+  NVL(a.matching_rows, 0) AS matching_rows,
+
+  CASE WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass' ELSE 'Audit Fail' END AS audit_status,
+
+  CASE
+    WHEN a.mstr_prov_id IS NULL THEN 'No rows found for this provider (check MSTR_PROV_ID).'
+    WHEN NVL(a.matching_rows, 0) > 0 THEN NULL
+    ELSE NVL(b.blocking_filters, 'Multiple filters failing together (see FAIL_SUMMARY + ROW_FAIL_DUE_TO).')
+  END AS fail_due_to,
+
+  CASE
+    WHEN a.mstr_prov_id IS NULL THEN NULL
+    ELSE
+      'RA_1_ID_FAIL=' || a.fail_ra_1_id ||
+      ', DIR_IND_FAIL=' || a.fail_dir_ind ||
+      ', RA_EFCTV_DT_FAIL=' || a.fail_ra_effdt ||
+      ', ADDR_FAIL=' || a.fail_addr
+  END AS fail_summary,
+
+  /* Representative row values (all base columns) */
+  p.MSTR_PROV_ID,
+  p.POA_KEY,
+  p.RA_1_ID,
+  p.DIR_IND,
+  p.ACPTG_NEW_PATS_IND,
+  p.RA_EFCTV_DT,
+  p.PROV_WTHLD_EFCTV_DT,
+  p.RA_SOR_CD,
+  p.RA_1_TYPE_CD,
+  p.CNTRCT_TFD_NBR,
+  p.FULL_ADDRESS,
+
+  /* Debug helpers */
+  p.pass_score,
+  p.row_fail_due_to
+
+FROM prov_list pl
+LEFT JOIN agg a
+  ON a.mstr_prov_id = pl.mstr_prov_id
+LEFT JOIN blocking b
+  ON b.mstr_prov_id = pl.mstr_prov_id
+LEFT JOIN pick_one p
+  ON p.mstr_prov_id = pl.mstr_prov_id
+ORDER BY pl.mstr_prov_id;

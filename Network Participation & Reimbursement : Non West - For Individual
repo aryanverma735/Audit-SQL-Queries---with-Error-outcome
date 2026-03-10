@@ -1,0 +1,439 @@
+WITH
+/* -------------------------------------------------
+   1) Parameters (single row)
+   - Provide networks as comma-separated list
+--------------------------------------------------*/
+params AS (
+  SELECT
+    /* Address to audit */
+    '801 E Williams Ave, Fallon, NV, 89406' AS full_addr,
+    REGEXP_REPLACE(UPPER('801 E Williams Ave, Fallon, NV, 89406'), '[^A-Z0-9]+', '') AS full_addr_norm,
+
+    /* Individual restriction */
+    '1101925164' AS p_ind_mstr_prov_id,
+
+    /* Networks you want output for */
+    'NVHMNN00,NVHPT200,NVHPX100,NVXPPO00' AS p_network_list,
+
+    /* J filters */
+    'Y' AS p_j_dir_dsply_ind,
+    'P' AS p_j_role_cd,
+    '99999' AS p_j_max_mbr_cnt,
+    '0' AS p_j_min_age,
+    '999' AS p_j_max_age,
+    'Both' AS p_gender_nm,
+    TO_DATE('05/30/2024','MM/DD/YYYY') AS p_j_eff_dt,
+
+    /* Accepting new patients (by CD_VAL name from C) */
+    'Accepting New Patients' AS p_accepting_nm,
+
+    /* Specialty filters */
+    'Family Medicine' AS p_spclty_nm,
+    TO_DATE('05/30/2024','MM/DD/YYYY') AS p_rs_eff_dt,
+    'Y' AS p_rs_prmry_ind,
+
+    /* Optional specialty termination date rule (disabled by default) */
+    TO_DATE(NULL,'MM/DD/YYYY') AS p_rs_trm_dt
+
+  FROM dual
+),
+
+/* -------------------------------------------------
+   2) Expand network list into rows
+--------------------------------------------------*/
+network_list AS (
+  SELECT TRIM(REGEXP_SUBSTR(p.p_network_list, '[^,]+', 1, LEVEL)) AS rgnl_ntwk_id
+  FROM params p
+  CONNECT BY REGEXP_SUBSTR(p.p_network_list, '[^,]+', 1, LEVEL) IS NOT NULL
+),
+
+/* -------------------------------------------------
+   3) Base dataset
+   - Restrict ONLY by IND + provided networks
+   - Convert Accepting + Specialty joins to LEFT JOIN so failures are visible
+--------------------------------------------------*/
+base AS (
+  SELECT DISTINCT
+    L_IND.MSTR_PROV_ID          AS IND_MSTR_PROV_ID,
+    K.MSTR_PROV_ID              AS ORG_EID,
+
+    /* ✅ FIX: include related address key so pick_one can use it */
+    K.RLTD_PADRS_KEY            AS RLTD_PADRS_KEY,
+
+    M.PADRS_TYPE_CD             AS PADRS_TYPE_CD,
+
+    /* Build ADDRESS_FULL once (same logic as your original) */
+    (
+      SELECT LISTAGG(val, ', ') WITHIN GROUP (ORDER BY pos)
+      FROM (
+        SELECT 1 AS pos, NULLIF(TRIM(S.ADRS_LINE_1_TXT), '') AS val FROM dual
+        UNION ALL SELECT 2, NULLIF(TRIM(S.ADRS_LINE_2_TXT), '') FROM dual
+        UNION ALL SELECT 3, NULLIF(TRIM(S.ADRS_LINE_3_TXT), '') FROM dual
+        UNION ALL SELECT 4, NULLIF(TRIM(S.ADRS_CITY_NM),  '') FROM dual
+        UNION ALL SELECT 5,
+          CASE
+            WHEN NVL(TRIM(S.POSTL_CD_ST_PRVNC_NM), '') IS NOT NULL
+              OR NVL(TRIM(S.POSTL_CD), '') IS NOT NULL
+            THEN TRIM(
+                   NVL(TRIM(S.POSTL_CD_ST_PRVNC_NM), '') ||
+                   CASE
+                     WHEN NVL(TRIM(S.POSTL_CD_ST_PRVNC_NM), '') IS NOT NULL
+                      AND NVL(TRIM(S.POSTL_CD), '') IS NOT NULL
+                     THEN ' ' ELSE '' END ||
+                   NVL(TRIM(S.POSTL_CD), '')
+                 )
+            ELSE NULL
+          END
+        FROM dual
+      )
+      WHERE val IS NOT NULL
+    ) AS ADDRESS_FULL,
+
+    NW.RGNL_NTWK_ID,
+    NW.NTWK_TRMNTN_DT,
+    NW.NTWK_TRMNTN_RSN_CD,
+
+    J.RLTD_PADRS_NTWK_EFCTV_DT,
+    J.RLTD_PADRS_NTWK_TRMNTN_DT,
+    J.RLTD_PADRS_NTWK_TRMNTN_RSN_CD,
+
+    /* Accepting patients */
+    PNC.CP_TYPE_CD AS ACPTG_PTNT_IND,
+    C.CD_VAL_NM    AS ACPTG_PTNT_NM,
+
+    /* From N/J */
+    N.POA_NTWK_TRMNTN_RSN_CD,
+    J.MAX_MBR_CNT,
+    J.DIR_DSPLY_IND,
+    J.MIN_AGE_NBR,
+    J.MAX_AGE_NBR,
+    J.PAT_GNDR_CD,
+    CC.CD_VAL_NM AS GENDER_NM,
+    J.DIR_SPRSN_RSN_CD,
+    J.ROLE_CD,
+
+    /* Specialty */
+    PS.SPCLTY_CD,
+    RS.RLTD_PADRS_NW_SPCLTY_EFCTV_DT,
+    RS.RLTD_PADRS_NW_SPCLTY_TRM_DT,
+    RS.PRMRY_SPCLTY_IND,
+    PN.SPCLTY_NM
+
+  FROM SPSOWNER.RLTD_PADRS_NTWK J
+
+  /* Gender name */
+  LEFT JOIN CD_VAL CC
+    ON J.PAT_GNDR_CD = CC.CD_VAL_CD
+
+  JOIN SPSOWNER.RLTD_PADRS K
+    ON K.RLTD_PADRS_KEY = J.RLTD_PADRS_KEY
+
+  JOIN SPSOWNER.PROV L_ORG
+    ON L_ORG.MSTR_PROV_ID = K.MSTR_PROV_ID
+
+  JOIN SPSOWNER.PROV L_IND
+    ON L_IND.MSTR_PROV_ID = K.RLTD_MSTR_PROV_ID
+
+  JOIN SPSOWNER.POA M
+    ON M.POA_KEY = K.POA_KEY
+
+  JOIN SPSOWNER.POA_NTWK N
+    ON N.POA_NTWK_KEY = J.POA_NTWK_KEY
+
+  JOIN SPSOWNER.PROV_ORG_NTWK PON
+    ON PON.PROV_ORG_NTWK_KEY = N.PROV_ORG_NTWK_KEY
+   AND PON.MSTR_PROV_ID = L_ORG.MSTR_PROV_ID
+
+  JOIN SPSOWNER.NTWK NW
+    ON PON.NTWK_KEY = NW.NTWK_KEY
+
+  JOIN SPSOWNER.STNDRDZD_ADRS S
+    ON M.SPS_STNDRDZD_ADRS_ID = S.SPS_STNDRDZD_ADRS_ID
+
+  /* Accepting New Patients */
+  LEFT JOIN SPSOWNER.RLTD_PADRS_NTWK_CP PNC
+    ON PNC.RLTD_PADRS_NTWK_KEY = J.RLTD_PADRS_NTWK_KEY
+  LEFT JOIN CD_VAL C
+    ON PNC.CP_TYPE_CD = C.CD_VAL_CD
+
+  /* Specialty */
+  LEFT JOIN SPSOWNER.RLTD_PADRS_NTWK_SPCLTY RS
+    ON J.RLTD_PADRS_NTWK_KEY = RS.RLTD_PADRS_NTWK_KEY
+  LEFT JOIN PROV_SPCLTY PS
+    ON RS.PROV_SPCLTY_KEY = PS.PROV_SPCLTY_KEY
+  LEFT JOIN BOT_PRCG_SPCLTY_XREF PN
+    ON PS.SPCLTY_CD = PN.SPCLTY_CD
+
+  CROSS JOIN params p
+  JOIN network_list nl
+    ON nl.rgnl_ntwk_id = NW.RGNL_NTWK_ID
+
+  WHERE
+    /* Only the core restriction here */
+    L_IND.MSTR_PROV_ID = p.p_ind_mstr_prov_id
+),
+
+/* -------------------------------------------------
+   4) Evaluate rules (1 pass, 0 fail)
+--------------------------------------------------*/
+eval AS (
+  SELECT
+    b.*,
+
+    /* Normalize the built address exactly like your audit */
+    REGEXP_REPLACE(UPPER(b.ADDRESS_FULL), '[^A-Z0-9]+', '') AS addr_norm,
+
+    /* Address rule */
+    CASE WHEN REGEXP_REPLACE(UPPER(b.ADDRESS_FULL), '[^A-Z0-9]+', '') = p.full_addr_norm
+         THEN 1 ELSE 0 END AS ok_addr,
+
+    /* J filters */
+    CASE WHEN UPPER(b.DIR_DSPLY_IND) = UPPER(p.p_j_dir_dsply_ind) THEN 1 ELSE 0 END AS ok_j_dir,
+    CASE WHEN UPPER(b.ROLE_CD) = UPPER(p.p_j_role_cd) THEN 1 ELSE 0 END AS ok_j_role,
+    CASE WHEN TO_CHAR(b.MAX_MBR_CNT) = p.p_j_max_mbr_cnt THEN 1 ELSE 0 END AS ok_j_maxmbr,
+    CASE WHEN TO_CHAR(b.MIN_AGE_NBR) = p.p_j_min_age THEN 1 ELSE 0 END AS ok_j_minage,
+    CASE WHEN TO_CHAR(b.MAX_AGE_NBR) = p.p_j_max_age THEN 1 ELSE 0 END AS ok_j_maxage,
+    CASE WHEN b.GENDER_NM = p.p_gender_nm THEN 1 ELSE 0 END AS ok_gender,
+    CASE WHEN b.RLTD_PADRS_NTWK_EFCTV_DT = p.p_j_eff_dt THEN 1 ELSE 0 END AS ok_j_effdt,
+
+    /* Accepting new patients by name */
+    CASE WHEN b.ACPTG_PTNT_NM = p.p_accepting_nm THEN 1 ELSE 0 END AS ok_accepting,
+
+    /* Specialty */
+    CASE WHEN UPPER(b.SPCLTY_NM) = UPPER(p.p_spclty_nm) THEN 1 ELSE 0 END AS ok_spclty,
+    CASE WHEN b.RLTD_PADRS_NW_SPCLTY_EFCTV_DT = p.p_rs_eff_dt THEN 1 ELSE 0 END AS ok_rs_effdt,
+    CASE WHEN UPPER(b.PRMRY_SPCLTY_IND) = UPPER(p.p_rs_prmry_ind) THEN 1 ELSE 0 END AS ok_rs_primary,
+    CASE
+      WHEN p.p_rs_trm_dt IS NULL THEN 1
+      WHEN b.RLTD_PADRS_NW_SPCLTY_TRM_DT = p.p_rs_trm_dt THEN 1
+      ELSE 0
+    END AS ok_rs_trm,
+
+    /* Score to pick representative row */
+    (
+      CASE WHEN REGEXP_REPLACE(UPPER(b.ADDRESS_FULL), '[^A-Z0-9]+', '') = p.full_addr_norm THEN 1 ELSE 0 END
+    + CASE WHEN UPPER(b.DIR_DSPLY_IND) = UPPER(p.p_j_dir_dsply_ind) THEN 1 ELSE 0 END
+    + CASE WHEN UPPER(b.ROLE_CD) = UPPER(p.p_j_role_cd) THEN 1 ELSE 0 END
+    + CASE WHEN TO_CHAR(b.MAX_MBR_CNT) = p.p_j_max_mbr_cnt THEN 1 ELSE 0 END
+    + CASE WHEN TO_CHAR(b.MIN_AGE_NBR) = p.p_j_min_age THEN 1 ELSE 0 END
+    + CASE WHEN TO_CHAR(b.MAX_AGE_NBR) = p.p_j_max_age THEN 1 ELSE 0 END
+    + CASE WHEN b.GENDER_NM = p.p_gender_nm THEN 1 ELSE 0 END
+    + CASE WHEN b.RLTD_PADRS_NTWK_EFCTV_DT = p.p_j_eff_dt THEN 1 ELSE 0 END
+    + CASE WHEN b.ACPTG_PTNT_NM = p.p_accepting_nm THEN 1 ELSE 0 END
+    + CASE WHEN UPPER(b.SPCLTY_NM) = UPPER(p.p_spclty_nm) THEN 1 ELSE 0 END
+    + CASE WHEN b.RLTD_PADRS_NW_SPCLTY_EFCTV_DT = p.p_rs_eff_dt THEN 1 ELSE 0 END
+    + CASE WHEN UPPER(b.PRMRY_SPCLTY_IND) = UPPER(p.p_rs_prmry_ind) THEN 1 ELSE 0 END
+    + CASE WHEN p.p_rs_trm_dt IS NULL THEN 1
+           WHEN b.RLTD_PADRS_NW_SPCLTY_TRM_DT = p.p_rs_trm_dt THEN 1 ELSE 0 END
+    ) AS pass_score
+
+  FROM base b
+  CROSS JOIN params p
+),
+
+/* -------------------------------------------------
+   5) Aggregate per network (1 row per network)
+--------------------------------------------------*/
+agg AS (
+  SELECT
+    e.RGNL_NTWK_ID,
+    COUNT(*) AS base_rows,
+    SUM(
+      CASE WHEN
+        ok_addr=1
+        AND ok_j_dir=1 AND ok_j_role=1 AND ok_j_maxmbr=1 AND ok_j_minage=1 AND ok_j_maxage=1
+        AND ok_gender=1
+        AND ok_accepting=1
+        AND ok_j_effdt=1
+        AND ok_spclty=1 AND ok_rs_effdt=1 AND ok_rs_primary=1 AND ok_rs_trm=1
+      THEN 1 ELSE 0 END
+    ) AS matching_rows,
+
+    /* Fail counts */
+    SUM(CASE WHEN ok_addr=0 THEN 1 ELSE 0 END) AS fail_addr,
+    SUM(CASE WHEN ok_j_dir=0 THEN 1 ELSE 0 END) AS fail_j_dir,
+    SUM(CASE WHEN ok_j_role=0 THEN 1 ELSE 0 END) AS fail_j_role,
+    SUM(CASE WHEN ok_j_maxmbr=0 THEN 1 ELSE 0 END) AS fail_j_maxmbr,
+    SUM(CASE WHEN ok_j_minage=0 THEN 1 ELSE 0 END) AS fail_j_minage,
+    SUM(CASE WHEN ok_j_maxage=0 THEN 1 ELSE 0 END) AS fail_j_maxage,
+    SUM(CASE WHEN ok_gender=0 THEN 1 ELSE 0 END) AS fail_gender,
+    SUM(CASE WHEN ok_accepting=0 THEN 1 ELSE 0 END) AS fail_accepting,
+    SUM(CASE WHEN ok_j_effdt=0 THEN 1 ELSE 0 END) AS fail_j_effdt,
+    SUM(CASE WHEN ok_spclty=0 THEN 1 ELSE 0 END) AS fail_spclty,
+    SUM(CASE WHEN ok_rs_effdt=0 THEN 1 ELSE 0 END) AS fail_rs_effdt,
+    SUM(CASE WHEN ok_rs_primary=0 THEN 1 ELSE 0 END) AS fail_rs_primary,
+    SUM(CASE WHEN ok_rs_trm=0 THEN 1 ELSE 0 END) AS fail_rs_trm
+  FROM eval e
+  GROUP BY e.RGNL_NTWK_ID
+),
+
+/* -------------------------------------------------
+   6) Blocking filters per network (no row passes the rule)
+--------------------------------------------------*/
+blocking AS (
+  SELECT
+    a.RGNL_NTWK_ID,
+    LISTAGG(fail_field, ', ') WITHIN GROUP (ORDER BY fail_field) AS blocking_filters
+  FROM (
+    SELECT rgnl_ntwk_id, 'ADDRESS_FULL' AS fail_field FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_addr) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'J.DIR_DSPLY_IND' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_j_dir) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'J.ROLE_CD' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_j_role) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'J.MAX_MBR_CNT' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_j_maxmbr) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'J.MIN_AGE_NBR' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_j_minage) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'J.MAX_AGE_NBR' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_j_maxage) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'PAT_GNDR (Both)' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_gender) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'Accepting New Patients' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_accepting) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'J.RLTD_PADRS_NTWK_EFCTV_DT' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_j_effdt) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'PN.SPCLTY_NM' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_spclty) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'RS.EFF_DT' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_rs_effdt) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'RS.PRMRY_SPCLTY_IND' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_rs_primary) = 0
+
+    UNION ALL SELECT rgnl_ntwk_id, 'RS.TRM_DT' FROM agg
+    WHERE base_rows > 0 AND (base_rows - fail_rs_trm) = 0
+  ) x
+  JOIN agg a
+    ON a.RGNL_NTWK_ID = x.rgnl_ntwk_id
+  GROUP BY a.RGNL_NTWK_ID
+),
+
+/* -------------------------------------------------
+   7) Pick ONE representative row per network
+--------------------------------------------------*/
+pick_one AS (
+  SELECT *
+  FROM (
+    SELECT
+      e.*,
+      RTRIM(
+        (CASE WHEN e.ok_addr=0 THEN 'ADDRESS_FULL, ' END) ||
+        (CASE WHEN e.ok_j_dir=0 THEN 'J.DIR_DSPLY_IND, ' END) ||
+        (CASE WHEN e.ok_j_role=0 THEN 'J.ROLE_CD, ' END) ||
+        (CASE WHEN e.ok_j_maxmbr=0 THEN 'J.MAX_MBR_CNT, ' END) ||
+        (CASE WHEN e.ok_j_minage=0 THEN 'J.MIN_AGE_NBR, ' END) ||
+        (CASE WHEN e.ok_j_maxage=0 THEN 'J.MAX_AGE_NBR, ' END) ||
+        (CASE WHEN e.ok_gender=0 THEN 'GENDER(Both), ' END) ||
+        (CASE WHEN e.ok_accepting=0 THEN 'Accepting New Patients, ' END) ||
+        (CASE WHEN e.ok_j_effdt=0 THEN 'J.EFF_DT, ' END) ||
+        (CASE WHEN e.ok_spclty=0 THEN 'PN.SPCLTY_NM, ' END) ||
+        (CASE WHEN e.ok_rs_effdt=0 THEN 'RS.EFF_DT, ' END) ||
+        (CASE WHEN e.ok_rs_primary=0 THEN 'RS.PRMRY_SPCLTY_IND, ' END) ||
+        (CASE WHEN e.ok_rs_trm=0 THEN 'RS.TRM_DT, ' END)
+      , ', ') AS row_fail_due_to,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY e.RGNL_NTWK_ID
+        ORDER BY
+          e.pass_score DESC,
+          e.RLTD_PADRS_NTWK_EFCTV_DT DESC NULLS LAST,
+          e.RLTD_PADRS_KEY DESC
+      ) AS rn
+    FROM eval e
+  )
+  WHERE rn = 1
+)
+
+/* -------------------------------------------------
+   8) Final output: EXACTLY 1 row per provided network
+--------------------------------------------------*/
+SELECT
+  nl.rgnl_ntwk_id,
+
+  NVL(a.base_rows, 0) AS base_rows,
+  NVL(a.matching_rows, 0) AS matching_rows,
+
+  CASE WHEN NVL(a.matching_rows, 0) > 0 THEN 'Audit Pass' ELSE 'Audit Fail' END AS audit_status,
+
+  CASE
+    WHEN a.rgnl_ntwk_id IS NULL THEN 'No rows found for this network under IND restriction.'
+    WHEN NVL(a.matching_rows, 0) > 0 THEN NULL
+    ELSE NVL(b.blocking_filters, 'Multiple filters failing together (see FAIL_SUMMARY + ROW_FAIL_DUE_TO).')
+  END AS fail_due_to,
+
+  CASE
+    WHEN a.rgnl_ntwk_id IS NULL THEN NULL
+    ELSE
+      'ADDR_FAIL=' || a.fail_addr ||
+      ', DIR_FAIL=' || a.fail_j_dir ||
+      ', ROLE_FAIL=' || a.fail_j_role ||
+      ', MAX_MBR_FAIL=' || a.fail_j_maxmbr ||
+      ', MIN_AGE_FAIL=' || a.fail_j_minage ||
+      ', MAX_AGE_FAIL=' || a.fail_j_maxage ||
+      ', GENDER_FAIL=' || a.fail_gender ||
+      ', ACCEPTING_FAIL=' || a.fail_accepting ||
+      ', J_EFFDT_FAIL=' || a.fail_j_effdt ||
+      ', SPCLTY_FAIL=' || a.fail_spclty ||
+      ', RS_EFFDT_FAIL=' || a.fail_rs_effdt ||
+      ', RS_PRIMARY_FAIL=' || a.fail_rs_primary ||
+      ', RS_TRM_FAIL=' || a.fail_rs_trm
+  END AS fail_summary,
+
+  /* Representative row values (all your columns) */
+  p.IND_MSTR_PROV_ID,
+  p.ORG_EID,
+  p.RLTD_PADRS_KEY,
+  p.PADRS_TYPE_CD,
+  p.ADDRESS_FULL,
+
+  p.RGNL_NTWK_ID,
+  p.NTWK_TRMNTN_DT,
+  p.NTWK_TRMNTN_RSN_CD,
+
+  p.RLTD_PADRS_NTWK_EFCTV_DT,
+  p.RLTD_PADRS_NTWK_TRMNTN_DT,
+  p.RLTD_PADRS_NTWK_TRMNTN_RSN_CD,
+
+  p.ACPTG_PTNT_IND,
+  p.ACPTG_PTNT_NM,
+
+  p.POA_NTWK_TRMNTN_RSN_CD,
+
+  p.MAX_MBR_CNT,
+  p.DIR_DSPLY_IND,
+  p.MIN_AGE_NBR,
+  p.MAX_AGE_NBR,
+  p.PAT_GNDR_CD,
+  p.GENDER_NM,
+  p.DIR_SPRSN_RSN_CD,
+  p.ROLE_CD,
+
+  p.SPCLTY_CD,
+  p.RLTD_PADRS_NW_SPCLTY_EFCTV_DT,
+  p.RLTD_PADRS_NW_SPCLTY_TRM_DT,
+  p.PRMRY_SPCLTY_IND,
+  p.SPCLTY_NM,
+
+  /* Debug helpers */
+  p.pass_score,
+  p.row_fail_due_to
+
+FROM network_list nl
+LEFT JOIN agg a
+  ON a.rgnl_ntwk_id = nl.rgnl_ntwk_id
+LEFT JOIN blocking b
+  ON b.rgnl_ntwk_id = nl.rgnl_ntwk_id
+LEFT JOIN pick_one p
+  ON p.rgnl_ntwk_id = nl.rgnl_ntwk_id
+ORDER BY nl.rgnl_ntwk_id;
